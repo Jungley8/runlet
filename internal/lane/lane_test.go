@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Jungley8/runlet/internal/model"
 )
@@ -355,5 +356,158 @@ func TestStateRoundTrip(t *testing.T) {
 	}
 	if _, err := l.LoadState(); !os.IsNotExist(err) {
 		t.Fatalf("state survived ClearState: %v", err)
+	}
+}
+
+// TestCleanupLeavesASymlinkedWorkAlone: a job can replace _work with a symlink.
+// RemoveAll on the entries would then delete files outside the lane.
+func TestCleanupLeavesASymlinkedWorkAlone(t *testing.T) {
+	opts := testOptions(t, &fakeExec{})
+	l := New(opts)
+	if err := l.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	canary := filepath.Join(outside, "canary")
+	if err := os.WriteFile(canary, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	work := filepath.Join(opts.Dir, "_work")
+	if err := os.RemoveAll(work); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, work); err != nil {
+		t.Fatal(err)
+	}
+
+	l.Cleanup(context.Background())
+
+	if _, err := os.Stat(canary); err != nil {
+		t.Fatalf("cleanup followed a symlinked _work: %v", err)
+	}
+}
+
+// TestCleanupLeavesASymlinkedDiagAlone: rotateDiag walks _diag, so a symlinked
+// directory would let a job age out files it does not own.
+func TestCleanupLeavesASymlinkedDiagAlone(t *testing.T) {
+	opts := testOptions(t, &fakeExec{})
+	l := New(opts)
+	if err := l.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	old := filepath.Join(outside, "old.log")
+	if err := os.WriteFile(old, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().Add(-30 * 24 * time.Hour)
+	if err := os.Chtimes(old, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(opts.Dir, "_diag")); err != nil {
+		t.Fatal(err)
+	}
+
+	l.Cleanup(context.Background())
+
+	if _, err := os.Stat(old); err != nil {
+		t.Fatalf("rotateDiag followed a symlinked _diag: %v", err)
+	}
+}
+
+// TestPrepareReplacesASymlinkedWork: the runner writes _work, so the lane needs
+// a real directory there. A symlink left by a job must be replaced, and its
+// target must survive.
+func TestPrepareReplacesASymlinkedWork(t *testing.T) {
+	opts := testOptions(t, &fakeExec{})
+	l := New(opts)
+	if err := os.MkdirAll(opts.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	canary := filepath.Join(outside, "canary")
+	if err := os.WriteFile(canary, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(opts.Dir, "_work")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := l.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Lstat(filepath.Join(opts.Dir, "_work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		t.Fatalf("_work is still %s", info.Mode())
+	}
+	if _, err := os.Stat(canary); err != nil {
+		t.Fatalf("the symlink target was deleted: %v", err)
+	}
+}
+
+// TestPrepareRecopiesLaunchFiles: bin/externals are skipped once the version
+// stamp matches, and launch scripts must not be. A job can rewrite config.sh;
+// the next attempt has to put the real one back.
+func TestPrepareRecopiesLaunchFiles(t *testing.T) {
+	opts := testOptions(t, &fakeExec{})
+	l := New(opts)
+	if err := l.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(opts.Dir, "config.sh")
+	if err := os.WriteFile(dst, []byte("#!/bin/sh\necho pwned\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := l.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "#!/bin/sh\n" {
+		t.Fatalf("config.sh was not restored: %q", raw)
+	}
+}
+
+// TestCopyFileRefusesASymlinkedSource: the source install belongs to the
+// operator. A symlink there must not turn into a readable copy in the lane.
+func TestCopyFileRefusesASymlinkedSource(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "secret")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "config.sh")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(link, filepath.Join(dir, "copy")); err == nil {
+		t.Fatal("copyFile followed a symlinked source")
+	}
+}
+
+// TestRunDoesNotHangOnAPipeHeldByAGrandchild: the runner is a grandchild of
+// runlet (systemd-run -> run.sh) and inherits stdout. When the direct child
+// exits, the pipe stays open. Without WaitDelay, Stop blocks until the job
+// ends and systemd gives up and SIGKILLs the supervisor.
+func TestRunDoesNotHangOnAPipeHeldByAGrandchild(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh")
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- OS{}.Run(context.Background(), Command{Path: "/bin/sh", Args: []string{"-c", "sleep 30 & exit 0"}})
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * waitDelay):
+		t.Fatal("Run blocked on a pipe held open by a grandchild")
 	}
 }

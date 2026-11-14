@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/Jungley8/runlet/internal/config"
 	"github.com/Jungley8/runlet/internal/ghapi"
 	"github.com/Jungley8/runlet/internal/metrics"
+	"github.com/Jungley8/runlet/internal/model"
 	"github.com/Jungley8/runlet/internal/policy"
 )
 
@@ -72,7 +74,7 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	srv := &http.Server{
 		Addr:              s.opts.Config.Server.Listen,
-		Handler:           mux,
+		Handler:           hostGuard(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -106,6 +108,25 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
+// loopbackNames are the Host values the endpoints accept. A page on the web
+// can rebind its own DNS to 127.0.0.1 and read anything on loopback that does
+// not check the Host header; a loopback bind alone is not enough.
+var loopbackNames = map[string]bool{"127.0.0.1": true, "::1": true, "localhost": true}
+
+func hostGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if !loopbackNames[host] {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -123,6 +144,22 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+// dedupeByID keeps one entry per run. A run that moves from queued to
+// in_progress between the two list calls appears in both, and the duplicate
+// looks like a timestamp tie, which suppresses the whole group.
+func dedupeByID(runs []model.Run) []model.Run {
+	seen := make(map[int64]bool, len(runs))
+	out := runs[:0]
+	for _, r := range runs {
+		if seen[r.ID] {
+			continue
+		}
+		seen[r.ID] = true
+		out = append(out, r)
+	}
+	return out
 }
 
 func (s *Server) poll(ctx context.Context) {
@@ -192,7 +229,7 @@ func (s *Server) pollRepo(ctx context.Context, slug string, now time.Time, param
 	s.opts.Metrics.Set("runlet_policy_oldest_queued_seconds", map[string]string{"repo": slug}, float64(oldest))
 	s.setRepoStatus(slug, repoStatus{Queued: len(queued), Running: len(running), Oldest: oldest})
 
-	decisions := policy.Decide(slug, append(queued, running...), now, params)
+	decisions := policy.Decide(slug, dedupeByID(append(queued, running...)), now, params)
 	cancelled := 0
 	for _, d := range decisions {
 		s.opts.Metrics.Add("runlet_policy_decisions_total",

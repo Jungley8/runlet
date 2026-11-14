@@ -54,10 +54,18 @@ type Execer interface {
 // OS executes real processes.
 type OS struct{}
 
+// waitDelay bounds the wait for stdout after the direct child exits. A lane is
+// started through systemd-run, and the runner inherits the pipe. Killing
+// systemd-run does not close it: the scope keeps running on purpose, so without
+// this bound a supervisor stop blocks until the job ends and systemd gives up
+// and SIGKILLs the whole thing.
+const waitDelay = 5 * time.Second
+
 func (OS) Run(ctx context.Context, c Command) error {
 	cmd := exec.CommandContext(ctx, c.Path, c.Args...)
 	cmd.Dir = c.Dir
 	cmd.Env = c.Env
+	cmd.WaitDelay = waitDelay
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		// The output of config.sh and run.sh is the only diagnostic there is.
@@ -71,6 +79,7 @@ func (OS) Output(ctx context.Context, c Command) (string, error) {
 	cmd := exec.CommandContext(ctx, c.Path, c.Args...)
 	cmd.Dir = c.Dir
 	cmd.Env = c.Env
+	cmd.WaitDelay = waitDelay
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", c.String(), err)
@@ -174,7 +183,14 @@ func (l *Lane) Prepare() error {
 		return err
 	}
 	for _, d := range []string{l.opts.CacheDir + "/go-build", l.opts.CacheDir + "/go-mod", l.opts.CacheDir + "/pnpm", l.opts.StateDir} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			return err
+		}
+	}
+	// The lane directory is job-writable. A job can replace any of these with a
+	// symlink to somewhere else, and the next attempt would write through it.
+	for _, d := range []string{l.opts.Dir, l.homeDir(), filepath.Join(l.opts.Dir, "_work")} {
+		if err := ensureRealDir(d); err != nil {
 			return err
 		}
 	}
@@ -184,13 +200,34 @@ func (l *Lane) Prepare() error {
 	return l.syncRunnerTree()
 }
 
+// ensureRealDir makes path a real directory owned by us. A symlink or a plain
+// file at that name is removed first: following it would put job data, or the
+// supervisor's writes, outside the lane.
+func ensureRealDir(path string) error {
+	info, err := os.Lstat(path)
+	switch {
+	case os.IsNotExist(err):
+		return os.MkdirAll(path, 0o700)
+	case err != nil:
+		return err
+	case info.Mode()&os.ModeSymlink != 0 || !info.IsDir():
+		if err := os.RemoveAll(path); err != nil {
+			return err
+		}
+		return os.MkdirAll(path, 0o700)
+	}
+	return nil
+}
+
 // clearStaleRegistration drops the previous attempt's identity. config.sh
 // refuses to run while .runner exists ("already configured"), and every
 // interrupted attempt leaves one behind: the supervisor is killed, not the
 // runner. Each attempt registers under a fresh name, so the old one is dead.
+// RemoveAll, not Remove: a job can leave a directory at one of these names and
+// wedge the lane forever.
 func (l *Lane) clearStaleRegistration() error {
 	for name := range runnerStateFiles {
-		if err := os.Remove(filepath.Join(l.opts.Dir, name)); err != nil && !os.IsNotExist(err) {
+		if err := os.RemoveAll(filepath.Join(l.opts.Dir, name)); err != nil {
 			return err
 		}
 	}
@@ -211,10 +248,29 @@ func isLaunchFile(name string) bool {
 	return name == "version"
 }
 
-// syncRunnerTree hardlinks the runner install into the lane. A version change
-// in the source wipes the lane copy first, because a half-upgraded runner
-// fails in ways that look like flaky jobs.
+// syncRunnerTree copies the runner install into the lane. Launch files are
+// rewritten on every attempt: they are small, and a job owns the lane
+// directory between attempts. A tampered config.sh would otherwise be executed
+// by the supervisor itself, outside the lane's resource caps. bin and externals
+// are hardlinked once per runner version.
 func (l *Lane) syncRunnerTree() error {
+	// Every launch file is part of the install: run.sh needs
+	// run-helper.sh.template and safe_sleep.sh next to itself, and a missing
+	// helper makes the runner exit 0 before it ever listens.
+	entries, err := os.ReadDir(l.opts.RunnerDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !e.Type().IsRegular() || runnerStateFiles[e.Name()] || !isLaunchFile(e.Name()) {
+			continue
+		}
+		src := filepath.Join(l.opts.RunnerDir, e.Name())
+		if err := copyFile(src, filepath.Join(l.opts.Dir, e.Name())); err != nil {
+			return err
+		}
+	}
+
 	stamp := l.sourceStamp()
 	markerPath := filepath.Join(l.opts.Dir, ".runlet-runner-version")
 	if old, err := os.ReadFile(markerPath); err == nil && strings.TrimSpace(string(old)) == stamp && stamp != "" {
@@ -226,22 +282,6 @@ func (l *Lane) syncRunnerTree() error {
 	if err := os.RemoveAll(filepath.Join(l.opts.Dir, "externals")); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(l.opts.RunnerDir)
-	if err != nil {
-		return err
-	}
-	// Every launch file is part of the install: run.sh needs
-	// run-helper.sh.template and safe_sleep.sh next to itself, and a missing
-	// helper makes the runner exit 0 before it ever listens.
-	for _, e := range entries {
-		if !e.Type().IsRegular() || runnerStateFiles[e.Name()] || !isLaunchFile(e.Name()) {
-			continue
-		}
-		src := filepath.Join(l.opts.RunnerDir, e.Name())
-		if err := copyFile(src, filepath.Join(l.opts.Dir, e.Name())); err != nil {
-			return err
-		}
-	}
 	for _, name := range []string{"bin", "externals"} {
 		if err := linkTree(filepath.Join(l.opts.RunnerDir, name), filepath.Join(l.opts.Dir, name)); err != nil {
 			return err
@@ -249,6 +289,10 @@ func (l *Lane) syncRunnerTree() error {
 	}
 	return os.WriteFile(markerPath, []byte(stamp+"\n"), 0o644)
 }
+
+// maxLaunchFile bounds what the supervisor will read from a job-writable
+// directory. A 10 GiB "version" file would otherwise OOM it.
+const maxLaunchFile = 4 << 20
 
 // sourceStamp identifies the runner build. The official layout has a version
 // file; an install that came from the tarball may not, so the listener's size
@@ -267,13 +311,26 @@ func (l *Lane) sourceStamp() string {
 }
 
 func copyFile(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", src)
+	}
+	if info.Size() > maxLaunchFile {
+		return fmt.Errorf("%s is %d bytes, over the %d byte limit", src, info.Size(), maxLaunchFile)
+	}
 	raw, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
+	// The destination is in a job-writable directory. Writing through a
+	// planted symlink would clobber whatever it points at.
+	if old, err := os.Lstat(dst); err == nil && (old.Mode()&os.ModeSymlink != 0 || !old.Mode().IsRegular()) {
+		if err := os.RemoveAll(dst); err != nil {
+			return err
+		}
 	}
 	return os.WriteFile(dst, raw, info.Mode().Perm())
 }
@@ -394,6 +451,10 @@ func (l *Lane) Scope(unit string) Command {
 		"--property=MemoryMax=" + strconv.FormatInt(l.opts.Memory, 10),
 		"--property=KillMode=control-group",
 		"--property=TimeoutStopSec=20",
+		// Swap counts against nothing otherwise: MemoryMax caps RAM only, so a
+		// runaway job swaps the whole box instead of dying in its own cgroup.
+		"--property=MemorySwapMax=0",
+		"--property=TasksMax=2048",
 	}
 	if l.opts.MemoryHigh > 0 {
 		args = append(args, "--property=MemoryHigh="+strconv.FormatInt(l.opts.MemoryHigh, 10))
@@ -441,6 +502,24 @@ func (l *Lane) IsActive(ctx context.Context, unit string) bool {
 	return err == nil
 }
 
+// StartedAt returns when the unit became active, in microseconds since boot,
+// so adoption can tell a stale scope from the one running the current job.
+// Zero means "unknown".
+func (l *Lane) StartedAt(ctx context.Context, unit string) int64 {
+	out, err := l.opts.Exec.Output(ctx, Command{
+		Path: "systemctl",
+		Args: []string{"--user", "show", scopeName(unit), "--property=ActiveEnterTimestampMonotonic", "--value"},
+	})
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // ListUnits returns the unit names of every lane scope, active or not.
 func (l *Lane) ListUnits(ctx context.Context) ([]string, error) {
 	out, err := l.opts.Exec.Output(ctx, Command{
@@ -463,16 +542,23 @@ func (l *Lane) ListUnits(ctx context.Context) ([]string, error) {
 // Cleanup removes what a job leaves behind. It keeps _work/_actions: that is
 // the per-lane action cache, and dropping it makes every job re-download every
 // action.
+//
+// Every path here is job-writable, and both ReadDir and RemoveAll follow a
+// symlinked directory. A job that replaces _work with a link to $HOME would
+// otherwise make the supervisor delete the user's home directory.
 func (l *Lane) Cleanup(ctx context.Context) {
 	work := filepath.Join(l.opts.Dir, "_work")
-	entries, err := os.ReadDir(work)
-	if err == nil {
-		for _, e := range entries {
-			if e.Name() == "_actions" {
-				continue
-			}
-			if err := os.RemoveAll(filepath.Join(work, e.Name())); err != nil {
-				l.opts.Log.Warn("lane cleanup", "lane", l.opts.Name, "path", e.Name(), "err", err)
+	if info, err := os.Lstat(work); err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+		entries, err := os.ReadDir(work)
+		if err == nil {
+			for _, e := range entries {
+				if e.Name() == "_actions" {
+					continue
+				}
+				path := filepath.Join(work, e.Name())
+				if err := os.RemoveAll(path); err != nil {
+					l.opts.Log.Warn("lane cleanup", "lane", l.opts.Name, "path", e.Name(), "err", err)
+				}
 			}
 		}
 	}
@@ -480,6 +566,11 @@ func (l *Lane) Cleanup(ctx context.Context) {
 }
 
 func rotateDiag(dir string, maxAge time.Duration) {
+	// Same hazard as _work: a symlinked _diag would make this prune files
+	// somewhere else.
+	if info, err := os.Lstat(dir); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return

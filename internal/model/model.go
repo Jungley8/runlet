@@ -3,7 +3,10 @@
 // type without importing each other.
 package model
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 // Run is the subset of a workflow run that runlet reads. The JSON tags match
 // the REST API; the YAML tags let a recorded snapshot be replayed.
@@ -26,6 +29,38 @@ type Run struct {
 	// RunnerName is set on job objects, not on runs. It is kept here so the
 	// lane supervisor can find the job assigned to a runner that died.
 	RunnerName string `json:"runner_name,omitempty" yaml:"runner_name,omitempty"`
+	// PullRequests is the list of pull requests a run belongs to. One head
+	// branch can feed several PRs with different base branches; without the
+	// base they collide in the group key and one is wrongly cancelled.
+	PullRequests []PullRequest `json:"pull_requests,omitempty" yaml:"pull_requests,omitempty"`
+}
+
+// PullRequest is the slice of a workflow run's pull_requests entry that runlet
+// reads.
+type PullRequest struct {
+	Number int        `json:"number" yaml:"number"`
+	Base   *Reference `json:"base,omitempty" yaml:"base,omitempty"`
+}
+
+// Reference is a git ref object. Only the branch name is read.
+type Reference struct {
+	Ref string `json:"ref" yaml:"ref"`
+}
+
+// BaseRefs returns the distinct base branches, sorted. An empty result means
+// the API omitted the field, which is treated as "no base information".
+func (r Run) BaseRefs() []string {
+	seen := make(map[string]bool, len(r.PullRequests))
+	var out []string
+	for _, pr := range r.PullRequests {
+		if pr.Base == nil || pr.Base.Ref == "" || seen[pr.Base.Ref] {
+			continue
+		}
+		seen[pr.Base.Ref] = true
+		out = append(out, pr.Base.Ref)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Repository identifies a fork or the base repository.

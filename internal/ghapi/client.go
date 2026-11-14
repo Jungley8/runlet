@@ -288,6 +288,14 @@ func parseAPIError(resp *http.Response) error {
 	}
 	if ra := resp.Header.Get("Retry-After"); ra != "" {
 		if secs, err := strconv.Atoi(ra); err == nil {
+			// Clamp: an endpoint can otherwise park a repository for years, and
+			// a huge value overflows the Duration.
+			if secs < 0 {
+				secs = 0
+			}
+			if secs > 3600 {
+				secs = 3600
+			}
 			e.RetryAfter = time.Duration(secs) * time.Second
 		}
 	}

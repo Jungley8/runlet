@@ -129,6 +129,10 @@ func cmdServe(args []string) error {
 
 	// Build the supervisor before any goroutine starts: a missing admin token
 	// must stop the process, not half of it.
+	// One registry: the supervisor's lane gauges must be visible on the same
+	// /metrics endpoint the policy controllers write to.
+	reg := metrics.New()
+
 	var sup *supervisor.Supervisor
 	if len(cfg.Pool.Lanes) > 0 {
 		// systemd-run --user reaches the user manager only through the runtime
@@ -142,9 +146,10 @@ func cmdServe(args []string) error {
 			return err
 		}
 		sup, err = supervisor.New(supervisor.Options{
-			Config: cfg,
-			Client: ghapi.New(admin),
-			Log:    log,
+			Config:  cfg,
+			Client:  ghapi.New(admin),
+			Log:     log,
+			Metrics: reg,
 		})
 		if err != nil {
 			return err
@@ -157,7 +162,7 @@ func cmdServe(args []string) error {
 	srv := serve.New(serve.Options{
 		Config:     cfg,
 		Client:     ghapi.New(token),
-		Metrics:    metrics.New(),
+		Metrics:    reg,
 		Log:        log,
 		KillSwitch: killSwitch,
 	})

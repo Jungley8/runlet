@@ -5,6 +5,7 @@ package supervisor
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -79,7 +80,7 @@ func New(opts Options) (*Supervisor, error) {
 			MemoryHigh: lc.MemoryHigh.Int64(),
 			CPUQuota:   lc.CPUQuota,
 			RunnerDir:  pool.RunnerDir,
-			RunnerURL:  strings.TrimSpace(pool.RunnerURL),
+			RunnerURL:  scope.URL(),
 			Dir:        filepath.Join(pool.WorkDir, lc.Name),
 			StateDir:   filepath.Join(pool.StateDir, "lanes", lc.Name),
 			CacheDir:   filepath.Join(pool.WorkDir, "cache"),
@@ -140,8 +141,19 @@ func (s *Supervisor) adopt(ctx context.Context) {
 		found[idx] = append(found[idx], u)
 	}
 	for idx, list := range found {
-		keep := list[len(list)-1]
-		for _, u := range list[:len(list)-1] {
+		// Keep the one that started last. list-units order is not the start
+		// order, and stopping the scope that is running a job fails that run.
+		keep := list[0]
+		kept := s.lanes[idx].StartedAt(ctx, keep)
+		for _, u := range list[1:] {
+			if t := s.lanes[idx].StartedAt(ctx, u); t > kept {
+				keep, kept = u, t
+			}
+		}
+		for _, u := range list {
+			if u == keep {
+				continue
+			}
 			s.opts.Log.Warn("stopping a duplicate lane scope", "lane", s.lanes[idx].Name(), "unit", u)
 			_ = s.lanes[idx].Stop(ctx, u)
 		}
@@ -158,7 +170,7 @@ func (s *Supervisor) adopt(ctx context.Context) {
 func (s *Supervisor) sweepStale(ctx context.Context) {
 	keep := make(map[string]bool)
 	for _, l := range s.lanes {
-		if st, err := l.LoadState(); err == nil {
+		if st, err := l.LoadState(); err == nil && s.ownsRunner(st.RunnerName) {
 			keep[st.RunnerName] = true
 		}
 	}
@@ -167,9 +179,8 @@ func (s *Supervisor) sweepStale(ctx context.Context) {
 		s.opts.Log.Warn("stale registration sweep skipped", "err", err)
 		return
 	}
-	prefix := "runlet-" + s.host + "-lane-"
 	for _, r := range runners {
-		if !strings.HasPrefix(r.Name, prefix) || r.Status != "offline" || keep[r.Name] {
+		if !s.ownsRunner(r.Name) || r.Status != "offline" || keep[r.Name] {
 			continue
 		}
 		if err := s.opts.Client.DeleteRunner(ctx, s.scope.APIPath(), r.ID); err != nil {
@@ -178,6 +189,29 @@ func (s *Supervisor) sweepStale(ctx context.Context) {
 		}
 		s.opts.Log.Info("deleted a stale registration", "runner", r.Name, "id", r.ID)
 	}
+}
+
+// ownsRunner reports whether a name is one this instance could have minted:
+// runlet-<host>-lane-<index>-<8 hex>. A name read from a file that a job can
+// write must pass this before it reaches the delete API.
+func (s *Supervisor) ownsRunner(name string) bool {
+	prefix := "runlet-" + s.host + "-lane-"
+	rest, ok := strings.CutPrefix(name, prefix)
+	if !ok {
+		return false
+	}
+	head, tail, ok := strings.Cut(rest, "-")
+	if !ok {
+		return false
+	}
+	if _, err := strconv.Atoi(head); err != nil {
+		return false
+	}
+	if len(tail) != 8 {
+		return false
+	}
+	_, err := hex.DecodeString(tail)
+	return err == nil
 }
 
 func unitIndex(unit string) (int, bool) {
@@ -250,7 +284,14 @@ func (s *Supervisor) waitForUnit(ctx context.Context, l *lane.Lane, unit string)
 	delete(s.limits, l.Index())
 	s.mu.Unlock()
 	if st, err := l.LoadState(); err == nil {
-		s.deregister(stopCtx, st.RunnerName)
+		// The state file is job-writable. Only deregister the runner this very
+		// attempt registered, or a crafted file turns the supervisor into a
+		// confused deputy against the runner API.
+		if st.Unit == unit && s.ownsRunner(st.RunnerName) {
+			s.deregister(stopCtx, st.RunnerName)
+		} else {
+			s.opts.Log.Warn("ignoring a state file that does not match the adopted scope", "lane", l.Name(), "unit", unit, "state_unit", st.Unit, "runner", st.RunnerName)
+		}
 		_ = l.ClearState()
 	}
 }
@@ -271,8 +312,13 @@ func (s *Supervisor) attempt(ctx context.Context, l *lane.Lane) error {
 	if err := l.SaveState(st); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}
+	// On shutdown the state file stays: the next process adopts the scope and
+	// needs the runner name to deregister it. Every other exit clears it.
+	keepState := false
 	defer func() {
-		_ = l.ClearState()
+		if !keepState {
+			_ = l.ClearState()
+		}
 	}()
 
 	tok, err := s.opts.Client.CreateRegistrationToken(ctx, s.scope.APIPath())
@@ -295,6 +341,12 @@ func (s *Supervisor) attempt(ctx context.Context, l *lane.Lane) error {
 	// Cancelling ctx kills systemd-run; the scope's processes survive that, so
 	// the stop below runs on its own context.
 	runErr := s.opts.Exec.Run(ctx, l.Scope(st.Unit))
+	if ctx.Err() != nil {
+		// Shutting down. Adopt, do not kill: the scope and its job outlive this
+		// process, and the next supervisor picks the runner up by unit name.
+		keepState = true
+		return runErr
+	}
 
 	stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -308,6 +360,10 @@ func (s *Supervisor) attempt(ctx context.Context, l *lane.Lane) error {
 // removed itself. A hard kill leaves it behind, and the next online/offline
 // cycle keeps it in the list forever.
 func (s *Supervisor) deregister(ctx context.Context, name string) {
+	if !s.ownsRunner(name) {
+		s.opts.Log.Warn("refusing to deregister a name this instance did not mint", "runner", name)
+		return
+	}
 	runners, err := s.opts.Client.ListRunners(ctx, s.scope.APIPath())
 	if err != nil {
 		s.opts.Log.Warn("deregister: list runners failed", "runner", name, "err", err)

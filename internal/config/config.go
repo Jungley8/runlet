@@ -98,6 +98,10 @@ type RepoConfig struct {
 var slugRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 var slugPartRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
+// laneNameRE keeps a lane name a plain directory name. It must start with an
+// alphanumeric, which rejects ".", "..", and "./lane-0".
+var laneNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
 // loopbackHosts is an allowlist, not a check for a private range. A LAN address
 // is still reachable by every device on the network.
 var loopbackHosts = map[string]bool{
@@ -109,6 +113,20 @@ var loopbackHosts = map[string]bool{
 // Load reads path, rejects unknown keys, and validates. A returned config is
 // safe to run; nothing is filled in later.
 func Load(path string) (*Config, error) {
+	// The config is not just data: runner_dir names the scripts runlet
+	// executes, and lane names become paths it removes. Another user who can
+	// write it owns the service, so it gets the same permission check as the
+	// token file.
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("open config: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("config %s is not a regular file", path)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return nil, fmt.Errorf("config %s must be mode 0600 (is %04o)", path, perm)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open config: %w", err)
@@ -180,6 +198,11 @@ func (c *Config) Validate() error {
 	for i, l := range c.Pool.Lanes {
 		if strings.TrimSpace(l.Name) == "" {
 			errs = append(errs, fmt.Errorf("pool.lanes[%d].name is required", i))
+		} else if !laneNameRE.MatchString(l.Name) {
+			// The name becomes a directory under work_dir and state_dir, and
+			// Prepare removes paths inside it. ".." or a separator here would
+			// delete files outside the pool.
+			errs = append(errs, fmt.Errorf("pool.lanes[%d].name %q must match %s", i, l.Name, laneNameRE))
 		}
 		if laneNames[l.Name] {
 			errs = append(errs, fmt.Errorf("pool.lanes[%d].name %q is listed twice", i, l.Name))
@@ -245,7 +268,9 @@ type Scope struct {
 }
 
 // ParseScope accepts https://github.com/owner, https://github.com/owner/repo,
-// and the bare owner or owner/repo forms.
+// and the bare owner or owner/repo forms. The host is pinned: the registration
+// token is always minted against api.github.com, so handing a different host to
+// config.sh would post that token to whoever owns the name.
 func ParseScope(raw string) (Scope, error) {
 	s := strings.TrimSpace(raw)
 	if strings.Contains(s, "://") {
@@ -255,6 +280,12 @@ func ParseScope(raw string) (Scope, error) {
 		}
 		if u.Scheme != "https" {
 			return Scope{}, fmt.Errorf("pool.runner_url %q must use https", raw)
+		}
+		if u.User != nil {
+			return Scope{}, fmt.Errorf("pool.runner_url %q must not carry credentials", raw)
+		}
+		if u.Hostname() != "github.com" || u.Port() != "" {
+			return Scope{}, fmt.Errorf("pool.runner_url %q must point at github.com", raw)
 		}
 		s = strings.Trim(u.Path, "/")
 	}
@@ -280,6 +311,16 @@ func (s Scope) String() string {
 		return s.Owner
 	}
 	return s.Owner + "/" + s.Repo
+}
+
+// URL is what config.sh --url receives. It is rebuilt from the parsed scope so
+// the value handed to the runner cannot differ from the value that was
+// validated.
+func (s Scope) URL() string {
+	if s.Repo == "" {
+		return "https://github.com/" + s.Owner
+	}
+	return "https://github.com/" + s.Owner + "/" + s.Repo
 }
 
 // APIPath is the REST prefix for this scope's runners and registration tokens.

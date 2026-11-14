@@ -27,12 +27,23 @@ type fakeExec struct {
 	commands []lane.Command
 	units    string
 	active   bool
+	// started maps a unit name to its ActiveEnterTimestampMonotonic, the value
+	// adoption uses to tell a stale scope from the live one.
+	started map[string]string
+	// block makes the lane scope behave like a real one: systemd-run returns
+	// only when the context is cancelled, not when the scope's processes exit.
+	block bool
 }
 
-func (f *fakeExec) Run(_ context.Context, c lane.Command) error {
+func (f *fakeExec) Run(ctx context.Context, c lane.Command) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.commands = append(f.commands, c)
+	block := f.block
+	f.mu.Unlock()
+	if block && strings.Contains(c.Path, "systemd-run") {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	return nil
 }
 
@@ -42,6 +53,13 @@ func (f *fakeExec) Output(_ context.Context, c lane.Command) (string, error) {
 	f.commands = append(f.commands, c)
 	joined := strings.Join(c.Args, " ")
 	switch {
+	case strings.Contains(joined, "ActiveEnterTimestampMonotonic"):
+		for unit, ts := range f.started {
+			if strings.Contains(joined, unit) {
+				return ts, nil
+			}
+		}
+		return "", nil
 	case strings.Contains(joined, "list-units"):
 		return f.units, nil
 	case strings.Contains(joined, "is-active"):
@@ -257,12 +275,16 @@ func TestNewDefaultsTheExecer(t *testing.T) {
 }
 
 // TestAdoptStopsDuplicateScopes: two live scopes for one slot mean an earlier
-// supervisor left one behind. Keep one, stop the rest, start nothing new.
+// supervisor left one behind. Keep the newest, stop the rest, start nothing new.
 func TestAdoptStopsDuplicateScopes(t *testing.T) {
 	exec := &fakeExec{
 		units: "runlet-lane-0-aaaa1111.scope loaded active running x\n" +
 			"runlet-lane-0-bbbb2222.scope loaded active running x\n",
 		active: true,
+		started: map[string]string{
+			"runlet-lane-0-aaaa1111.scope": "1000",
+			"runlet-lane-0-bbbb2222.scope": "2000",
+		},
 	}
 	s := testSupervisor(t, exec, &ghStub{})
 
@@ -271,6 +293,7 @@ func TestAdoptStopsDuplicateScopes(t *testing.T) {
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// list-units order is not start order; bbbb2222 started later and must win.
 	if len(exec.find("stop runlet-lane-0-aaaa1111.scope")) != 1 {
 		t.Fatalf("the older scope was not stopped")
 	}
@@ -289,10 +312,13 @@ func TestSweepDeletesOfflineRegistrationsItDoesNotOwn(t *testing.T) {
 		{"id": 1, "name": "dead", "status": "offline"},
 		{"id": 2, "name": "live", "status": "online"},
 		{"id": 3, "name": "someone-else", "status": "offline"},
+		{"id": 4, "name": "lookalike", "status": "offline"},
 	}}
 	s := testSupervisor(t, &fakeExec{}, stub)
-	stub.runners[0]["name"] = "runlet-" + s.host + "-lane-0-dead"
-	stub.runners[1]["name"] = "runlet-" + s.host + "-lane-1-live"
+	stub.runners[0]["name"] = "runlet-" + s.host + "-lane-0-deadbeef"
+	stub.runners[1]["name"] = "runlet-" + s.host + "-lane-1-cafebabe"
+	// Right prefix, but the suffix is not the 8 hex chars this instance mints.
+	stub.runners[3]["name"] = "runlet-" + s.host + "-lane-2-notours"
 
 	s.sweepStale(context.Background())
 
@@ -330,5 +356,68 @@ func TestLockIsExclusive(t *testing.T) {
 
 	if _, err := s.lock(); err == nil {
 		t.Fatal("a second supervisor took the lock")
+	}
+}
+
+// TestShutdownLeavesTheScopeForAdoption: a supervisor stop must not kill a job.
+// The scope keeps running, so the state file has to stay on disk: the next
+// process adopts the unit and uses that name to deregister it.
+func TestShutdownLeavesTheScopeForAdoption(t *testing.T) {
+	exec := &fakeExec{block: true}
+	s := testSupervisor(t, exec, &ghStub{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	statePath := filepath.Join(s.opts.Config.Pool.StateDir, "lanes", "lane-0", "lane.json")
+	// Cancel once the attempt is really inside systemd-run, so the test checks
+	// the shutdown path and not a context that expired during setup.
+	go func() {
+		for i := 0; i < 500; i++ {
+			if _, err := os.Stat(statePath); err == nil && len(exec.find("systemd-run")) > 0 {
+				cancel()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		cancel()
+	}()
+	if err := s.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := exec.find("stop runlet-"); len(got) != 0 {
+		t.Fatalf("shutdown stopped the lane scope: %s", got[0].String())
+	}
+	st, err := s.lanes[0].LoadState()
+	if err != nil {
+		t.Fatalf("state file was cleared on shutdown: %v\ncommands: %v", err, debugCommands(exec))
+	}
+	if st.RunnerName == "" || st.Unit == "" {
+		t.Fatalf("state = %+v", st)
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("%s: %v\ncommands: %v", statePath, err, debugCommands(exec))
+	}
+}
+
+func debugCommands(f *fakeExec) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, c := range f.commands {
+		out = append(out, c.String())
+	}
+	return out
+}
+
+// TestAttemptClearsStateWhenTheScopeEnds: the same attempt on a live supervisor
+// cleans up after itself, so the state file must not survive.
+func TestAttemptClearsStateWhenTheScopeEnds(t *testing.T) {
+	s := testSupervisor(t, &fakeExec{}, &ghStub{})
+	if err := s.attempt(context.Background(), s.lanes[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.lanes[0].LoadState(); !os.IsNotExist(err) {
+		t.Fatalf("state survived a finished attempt: %v", err)
 	}
 }

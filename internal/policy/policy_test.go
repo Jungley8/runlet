@@ -214,3 +214,49 @@ func TestDecideNeverTargetsSurvivor(t *testing.T) {
 		}
 	}
 }
+
+func withBase(r model.Run, base string) model.Run {
+	r.PullRequests = []model.PullRequest{{Number: 1, Base: &model.Reference{Ref: base}}}
+	return r
+}
+
+// TestPRsAgainstDifferentBasesAreDifferentGroups: one head branch can feed a
+// PR to main and a PR to release/*. Grouping by head alone would cancel the
+// queued run of the older PR when the newer one is created.
+func TestPRsAgainstDifferentBasesAreDifferentGroups(t *testing.T) {
+	runs := []model.Run{
+		withBase(run(1, 7, "feature", "pull_request", StatusQueued, 5*time.Minute), "main"),
+		withBase(run(2, 7, "feature", "pull_request", StatusQueued, 1*time.Minute), "release/1.x"),
+	}
+	decisions := Decide("o/r", runs, now, Params{Grace: 45 * time.Second})
+	if len(decisions) != 0 {
+		t.Fatalf("PRs with different base branches were merged into one group: %+v", decisions)
+	}
+
+	// Same base: the newer run still supersedes the older one.
+	runs[1] = withBase(runs[1], "main")
+	decisions = Decide("o/r", runs, now, Params{Grace: 45 * time.Second})
+	if len(decisions) != 1 || decisions[0].RunID != 1 || decisions[0].SurvivorID != 2 {
+		t.Fatalf("decisions = %+v, want run 1 cancelled for run 2", decisions)
+	}
+}
+
+// TestBaseRefsAreStable: the key must not depend on the order the API lists PRs
+// in, or two runs of the same group would land in different keys.
+func TestBaseRefsAreStable(t *testing.T) {
+	refs := func(order ...string) model.Run {
+		r := run(1, 7, "b", "pull_request", StatusQueued, time.Minute)
+		for _, ref := range order {
+			r.PullRequests = append(r.PullRequests, model.PullRequest{Base: &model.Reference{Ref: ref}})
+		}
+		return r
+	}
+	a := groupKey(refs("main", "release/1.x", "main"))
+	b := groupKey(refs("release/1.x", "main"))
+	if a != b {
+		t.Fatalf("group key depends on PR order:\n%q\n%q", a, b)
+	}
+	if got := refs("main", "main").BaseRefs(); len(got) != 1 {
+		t.Fatalf("duplicate base refs were kept: %v", got)
+	}
+}

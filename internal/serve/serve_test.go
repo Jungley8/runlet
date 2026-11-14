@@ -14,6 +14,7 @@ import (
 	"github.com/Jungley8/runlet/internal/config"
 	"github.com/Jungley8/runlet/internal/ghapi"
 	"github.com/Jungley8/runlet/internal/metrics"
+	"github.com/Jungley8/runlet/internal/model"
 )
 
 // fakeGH serves the three endpoints the policy loop touches and records every
@@ -220,3 +221,58 @@ func discardLogger() *slog.Logger {
 
 func intPtr(v int) *int       { return &v }
 func strPtr(v string) *string { return &v }
+
+// TestHostGuardRejectsAForeignHost: a page can point its own DNS at 127.0.0.1
+// and talk to whatever listens there. A loopback bind alone does not stop it;
+// the Host header check does.
+func TestHostGuardRejectsAForeignHost(t *testing.T) {
+	h := hostGuard(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	cases := map[string]int{
+		"127.0.0.1:9464":    http.StatusOK,
+		"localhost:9464":    http.StatusOK,
+		"[::1]:9464":        http.StatusOK,
+		"evil.example:9464": http.StatusForbidden,
+		"rebind.attacker":   http.StatusForbidden,
+		"127.0.0.1.evil.io": http.StatusForbidden,
+		"":                  http.StatusForbidden,
+	}
+	for host, want := range cases {
+		req := httptest.NewRequest(http.MethodGet, "/status", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Fatalf("Host %q = %d, want %d", host, rec.Code, want)
+		}
+	}
+}
+
+// TestDedupeByID: a run that moves from queued to in_progress between the two
+// list calls appears twice. Two identical timestamps would look like a tie and
+// suppress the group, so the duplicate has to go.
+func TestDedupeByID(t *testing.T) {
+	now := time.Now()
+	in := []model.Run{
+		{ID: 2, CreatedAt: now},
+		{ID: 1, CreatedAt: now.Add(-time.Minute)},
+		{ID: 2, CreatedAt: now},
+		{ID: 3, CreatedAt: now.Add(-2 * time.Minute)},
+	}
+	got := dedupeByID(in)
+	if len(got) != 3 {
+		t.Fatalf("got %d runs, want 3", len(got))
+	}
+	for i := 0; i < len(got); i++ {
+		for j := i + 1; j < len(got); j++ {
+			if got[i].ID == got[j].ID {
+				t.Fatalf("run %d appears twice", got[i].ID)
+			}
+		}
+	}
+	if empty := dedupeByID(nil); len(empty) != 0 {
+		t.Fatalf("nil input produced %d runs", len(empty))
+	}
+}

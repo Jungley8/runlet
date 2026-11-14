@@ -135,7 +135,8 @@ something else on the machine. `runlet doctor` checks this; do not raise
 `pool.lanes` to meet a deadline.
 
 On restart, the supervisor adopts live `runlet-lane-*` scopes instead of starting
-duplicates, and a lock file stops a second supervisor.
+duplicates, and a lock file stops a second supervisor. A stop does not kill a
+running lane: the scope and its job continue, and the next process adopts them.
 
 ## Safety
 
@@ -146,7 +147,8 @@ duplicates, and a lock file stops a second supervisor.
 - Tag pushes have no branch and are never cancelled. A manual re-run is an
   explicit human instruction and is never cancelled.
 - Pull requests from different forks with the same branch name are different
-  groups.
+  groups, and so are pull requests from one head branch into different base
+  branches.
 - If two runs claim the newest timestamp, nothing in that group is cancelled.
 - Both the target and the newest run are re-read before a cancel. If the newest
   run already finished, nothing is cancelled: the older run is then the only
@@ -155,6 +157,50 @@ duplicates, and a lock file stops a second supervisor.
 - Create `KILL` in `~/.config/runlet/` (or in `pool.state_dir` when set) to
   pause cancellation without a restart.
 - Every cancellation writes an audit line with the run URL and the survivor.
+
+## Security
+
+`runlet` runs as a user service and starts runners in scopes of the same user.
+That has consequences you must decide on before you deploy it.
+
+What the code does:
+
+- The config file and the token file must be regular files with mode `0600`.
+  Anything else stops the process. Unknown keys and explicit zeros are errors.
+- The HTTP endpoint binds to loopback and rejects any `Host` header that is not
+  a loopback name, so a web page cannot reach it through DNS rebinding.
+- Tokens are never logged. The registration token is redacted from every
+  command and error message. The child environment carries the proxy and the
+  user bus only.
+- Lane directories are `0700`. Cleanup and log rotation refuse to follow a
+  symlink that a job planted in `_work` or `_diag`.
+- Runner names carry a per-instance prefix. Deregistration and the stale sweep
+  only touch names with that prefix, and an adopted scope is deregistered only
+  when the on-disk state file names that very unit.
+- Each scope is capped: `MemoryMax`, `MemoryHigh`, `MemorySwapMax=0`,
+  `TasksMax`, and `CPUQuota`.
+
+What the code cannot do for you:
+
+- **A job runs as the same user as `runlet`.** It can read
+  `~/.config/runlet/env` and `/proc/<runlet>/environ`, and the state directory.
+  Run this only for workflows you would let log in to the host. Never point it
+  at a repository that runs untrusted pull requests.
+- **An org-scope registration mints tokens for the whole org.** Every
+  repository in the organization can match the lane labels, including a fork
+  pull request someone approved. Add a label of your own (for example
+  `macmini-ci`) to every lane and require it in `runs-on`, and put the runner
+  in a runner group that only lists the repositories you mean.
+- **A job can start its own scope.** `systemd-run --user` inside a job creates
+  a sibling unit without the lane caps. The limits protect the host from
+  runaway builds, not from hostile ones. To bound that, cap the whole user
+  slice (`systemctl --user set-property user@$UID.service MemoryMax=…`) or
+  give the runners a dedicated user with its own slice limit.
+- **`bin` and `externals` are hardlinks.** A job that writes to its lane's
+  `bin/Runner.Listener` writes the shared inode, and every later lane runs the
+  modified binary. Re-extract the runner from a known tarball after a host has
+  run untrusted code. Pointing `pool.runner_dir` at an install you do not own
+  makes `runlet` copy instead of link, at the cost of disk.
 
 ## Metrics
 

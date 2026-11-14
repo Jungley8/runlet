@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -190,13 +191,16 @@ func TestParseScope(t *testing.T) {
 		path string
 		ok   bool
 	}{
-		"https://github.com/acme":       {"/orgs/acme/actions/runners", true},
-		"https://github.com/acme/repo":  {"/repos/acme/repo/actions/runners", true},
-		"acme":                          {"/orgs/acme/actions/runners", true},
-		"acme/repo":                     {"/repos/acme/repo/actions/runners", true},
-		"http://github.com/acme":        {"", false},
-		"https://github.com/a/b/c":      {"", false},
-		"https://gitlab.example/acme/x": {"/repos/acme/x/actions/runners", true},
+		"https://github.com/acme":              {"/orgs/acme/actions/runners", true},
+		"https://github.com/acme/repo":         {"/repos/acme/repo/actions/runners", true},
+		"acme":                                 {"/orgs/acme/actions/runners", true},
+		"acme/repo":                            {"/repos/acme/repo/actions/runners", true},
+		"http://github.com/acme":               {"", false},
+		"https://github.com/a/b/c":             {"", false},
+		"https://githubb.com/acme/repo":        {"", false},
+		"https://gitlab.example/acme/x":        {"", false},
+		"https://user:pw@github.com/acme/repo": {"", false},
+		"https://github.com:8443/acme/repo":    {"", false},
 	}
 	for in, want := range cases {
 		scope, err := ParseScope(in)
@@ -235,5 +239,29 @@ func TestParseBytes(t *testing.T) {
 	}
 	if _, err := ParseBytes("three gigs"); err == nil {
 		t.Fatal("want error for junk size")
+	}
+}
+
+// TestLoadRejectsAWorldReadableConfig: the config names the token file and the
+// state paths. Pre-v1.0 is fail-closed, so a loose mode stops the process.
+func TestLoadRejectsAWorldReadableConfig(t *testing.T) {
+	path := writeTemp(t, validYAML)
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "0600") {
+		t.Fatalf("want a 0600 error, got %v", err)
+	}
+}
+
+// TestValidateRejectsALaneNameThatIsAPath: the name becomes a directory under
+// state_dir and work_dir, so a name with a separator or dots escapes both.
+func TestValidateRejectsALaneNameThatIsAPath(t *testing.T) {
+	for _, name := range []string{"..", "../../etc", "./lane-0", "lane/0", ".hidden", ""} {
+		body := strings.Replace(validYAML, "name: lane-0", "name: "+strconv.Quote(name), 1)
+		_, err := Load(writeTemp(t, body))
+		if err == nil {
+			t.Fatalf("lane name %q was accepted", name)
+		}
 	}
 }

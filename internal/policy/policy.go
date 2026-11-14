@@ -6,6 +6,7 @@ package policy
 import (
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Jungley8/runlet/internal/model"
@@ -121,7 +122,14 @@ func Decide(repo string, runs []model.Run, now time.Time, p Params) []Decision {
 }
 
 func groupKey(r model.Run) string {
-	return workflowKey(r) + "\x00" + r.HeadRepo() + "\x00" + r.HeadBranch + "\x00" + r.Event
+	key := workflowKey(r) + "\x00" + r.HeadRepo() + "\x00" + r.HeadBranch + "\x00" + r.Event
+	// The same head branch can be the source of PRs against several base
+	// branches. Grouping by head alone would cancel one PR's queued run
+	// because another PR was created later.
+	if bases := r.BaseRefs(); len(bases) > 0 {
+		key += "\x00" + strings.Join(bases, ",")
+	}
+	return key
 }
 
 func workflowKey(r model.Run) string {
