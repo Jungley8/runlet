@@ -194,8 +194,10 @@ What the code cannot do for you:
 - **A job can start its own scope.** `systemd-run --user` inside a job creates
   a sibling unit without the lane caps. The limits protect the host from
   runaway builds, not from hostile ones. To bound that, cap the whole user
-  slice (`systemctl --user set-property user@$UID.service MemoryMax=…`) or
-  give the runners a dedicated user with its own slice limit.
+  slice from the system manager
+  (`sudo systemctl set-property user-1000.slice MemoryMax=4G`) and keep the cap
+  above the sum of the lane limits. Or give the runners a dedicated user and
+  cap that user's slice.
 - **`bin` and `externals` are hardlinks.** A job that writes to its lane's
   `bin/Runner.Listener` writes the shared inode, and every later lane runs the
   modified binary. Re-extract the runner from a known tarball after a host has
