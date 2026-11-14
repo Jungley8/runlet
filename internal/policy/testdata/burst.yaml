@@ -1,0 +1,47 @@
+# Recorded shape for `runlet policy check`. Three pushes to one branch left two
+# superseded runs queued; the newest run is the survivor.
+now: 2026-11-14T12:00:00Z
+repos:
+  - slug: octarq-org/octarq-pro
+    runs:
+      - id: 101
+        name: CI
+        workflow_id: 9001
+        head_branch: feat/workforce-i18n
+        event: pull_request
+        status: queued
+        created_at: 2026-11-14T11:40:00Z
+        html_url: https://github.com/octarq-org/octarq-pro/actions/runs/101
+      - id: 102
+        name: CI
+        workflow_id: 9001
+        head_branch: feat/workforce-i18n
+        event: pull_request
+        status: queued
+        created_at: 2026-11-14T11:50:00Z
+        html_url: https://github.com/octarq-org/octarq-pro/actions/runs/102
+      - id: 103
+        name: CI
+        workflow_id: 9001
+        head_branch: feat/workforce-i18n
+        event: pull_request
+        status: queued
+        created_at: 2026-11-14T11:59:00Z
+        html_url: https://github.com/octarq-org/octarq-pro/actions/runs/103
+      # A manual dispatch in the same workflow and branch is not a cancellation
+      # target, even though it is older.
+      - id: 104
+        name: CI
+        workflow_id: 9001
+        head_branch: feat/workforce-i18n
+        event: workflow_dispatch
+        status: queued
+        created_at: 2026-11-14T11:30:00Z
+      # A run that is already executing is never a target.
+      - id: 105
+        name: CI
+        workflow_id: 9001
+        head_branch: feat/workforce-i18n
+        event: pull_request
+        status: in_progress
+        created_at: 2026-11-14T11:35:00Z

@@ -1,0 +1,30 @@
+[Unit]
+Description=runlet - GitHub Actions runner scheduler
+Documentation=https://github.com/Jungley8/runlet
+After=network-online.target
+Wants=network-online.target
+# A broken config exits at once. Without a start limit systemd retries it every
+# RestartSec forever and the journal fills with the same error.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/runlet serve
+EnvironmentFile=-%h/.config/runlet/env
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=default.target

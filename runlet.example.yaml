@@ -1,0 +1,31 @@
+server:
+  listen: "127.0.0.1:9464"
+
+policy:
+  # dry-run logs the decisions and changes nothing. Set "apply" only after the
+  # dry-run log has matched expectations.
+  mode: "dry-run"
+  poll: "30s"
+  cancel_cap_per_hour: 20
+  grace_seconds: 45
+
+# P2 reads this block. The P1 controller ignores it.
+# Replace /home/you with your home directory; ~ is not expanded.
+pool:
+  state_dir: "/home/you/.local/state/runlet"
+  work_dir: "/home/you/lanes"
+  memory_budget: "3.5GiB"
+  lanes:
+    - name: "lane-0"
+      labels: ["self-hosted", "linux", "x64"]
+      memory: "1.5GiB"
+      memory_high: "1.2GiB"
+      cpu_quota: "250%"
+
+repos:
+  # Only these repositories are touched. A repository that is not listed here is
+  # never cancelled, and there is no wildcard.
+  - slug: "your-org/your-repo"
+    cancel_superseded: true
+  - slug: "your-org/another-repo"
+    cancel_superseded: true
