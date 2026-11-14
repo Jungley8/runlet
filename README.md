@@ -6,7 +6,7 @@ A single-host scheduler for self-hosted GitHub Actions runners.
 
 - **Cancellation:** cancel queued runs that a newer run on the same branch has
   superseded.
-- **Lanes:** run N resource-capped runner processes from one binary (P2).
+- **Lanes:** run N resource-capped runner processes from one binary.
 - **Reporting:** queue depth, oldest queued run, and lane state on `/metrics`
   and `/status`.
 
@@ -109,6 +109,10 @@ registration, its own directory, and its own systemd scope:
 
 - The runner install in `pool.runner_dir` is hardlinked into each lane. One
   inode per file, so a second lane costs almost no disk.
+- `pool.runner_dir` must be a complete extracted runner release, or a live
+  install of one. `run.sh` sources `run-helper.sh.template` and `safe_sleep.sh`
+  from its own directory; a copy that lacks them starts and exits before it
+  listens. Point it at the install directory, not at a hand-picked subset.
 - Each lane gets its own `HOME`, `.runner`, `.credentials`, and `_work`. Those
   are not safe to share between runner processes.
 - `GOCACHE`, `GOMODCACHE`, and `PNPM_STORE_DIR` point at one shared cache, so
