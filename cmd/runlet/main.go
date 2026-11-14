@@ -131,6 +131,12 @@ func cmdServe(args []string) error {
 	// must stop the process, not half of it.
 	var sup *supervisor.Supervisor
 	if len(cfg.Pool.Lanes) > 0 {
+		// systemd-run --user reaches the user manager only through the runtime
+		// directory. Without it every lane attempt dies on "No medium found", so
+		// refuse at startup instead of in a retry loop.
+		if os.Getenv("XDG_RUNTIME_DIR") == "" {
+			return errors.New("XDG_RUNTIME_DIR is not set: lanes need it to reach the systemd user manager")
+		}
 		admin, err := config.ResolveAdminToken(defaultEnvPath())
 		if err != nil {
 			return err

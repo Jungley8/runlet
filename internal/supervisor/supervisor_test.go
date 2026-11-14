@@ -235,6 +235,27 @@ func TestDrainStartsNothing(t *testing.T) {
 	}
 }
 
+func TestNewDefaultsTheExecer(t *testing.T) {
+	srv := httptest.NewServer((&ghStub{}).handler())
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfg := &config.Config{Pool: config.PoolConfig{
+		StateDir:  filepath.Join(dir, "state"),
+		WorkDir:   filepath.Join(dir, "work"),
+		RunnerDir: fakeRunnerDir(t),
+		RunnerURL: "https://github.com/acme",
+		Lanes:     []config.LaneConfig{{Name: "lane-0", Labels: []string{"self-hosted"}, Memory: config.Bytes(1 << 30)}},
+	}}
+	s, err := New(Options{Config: cfg, Client: ghapi.New("tok", ghapi.WithBaseURL(srv.URL))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.opts.Exec == nil {
+		t.Fatal("Exec is nil; a nil execer panics on the first lane attempt")
+	}
+}
+
 func TestUnitIndex(t *testing.T) {
 	cases := map[string]struct {
 		index int

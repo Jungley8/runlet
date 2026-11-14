@@ -17,14 +17,17 @@ RestartSec=5s
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
-PrivateDevices=yes
-ProtectSystem=strict
 ProtectKernelTunables=yes
-ProtectKernelModules=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-CapabilityBoundingSet=
 LockPersonality=yes
-# No MemoryDenyWriteExecute: the runner is .NET and JITs its own code.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Deliberately not set:
+#   PrivateDevices=, ProtectKernelModules=  the user manager cannot apply them
+#                                           and the exec fails with 218/CAPABILITIES
+#   ProtectSystem=strict                    lanes write under $HOME; a read-only
+#                                           hierarchy breaks every job
+#   CapabilityBoundingSet=                  a user unit cannot change it
+#   MemoryDenyWriteExecute=                 the runner is .NET and JITs
 
 [Install]
 WantedBy=default.target

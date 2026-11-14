@@ -52,11 +52,18 @@ func fakeRunnerDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	files := map[string]string{
-		"config.sh":           "#!/bin/sh\n",
-		"run.sh":              "#!/bin/sh\n",
-		"version":             "2.338.0\n",
-		"bin/Runner.Listener": "binary\n",
-		"externals/node":      "runtime\n",
+		"config.sh":              "#!/bin/sh\n",
+		"run.sh":                 "#!/bin/sh\n",
+		"run-helper.sh.template": "#!/bin/sh\n",
+		"safe_sleep.sh":          "#!/bin/sh\n",
+		"version":                "2.338.0\n",
+		".runner":                "{\"agentId\":1}",
+		".runner_migrated":       "{\"agentId\":1}",
+		".credentials":           "{}",
+		".path":                  "/root/bin\n",
+		"actions-runner.tar.gz":  "backup",
+		"bin/Runner.Listener":    "binary\n",
+		"externals/node":         "runtime\n",
 	}
 	for name, body := range files {
 		full := filepath.Join(dir, name)
@@ -210,6 +217,101 @@ func TestRegisterSurfacesFailureWithoutToken(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), tok) {
 		t.Fatalf("error leaked the token: %v", err)
+	}
+}
+
+// TestPrepareFollowsSymlinkedInstall: the installed runner keeps bin and
+// externals as symlinks to bin.<version>. filepath.Walk does not descend into
+// a symlinked root, so Prepare must resolve it.
+func TestPrepareFollowsSymlinkedInstall(t *testing.T) {
+	opts := testOptions(t, &fakeExec{})
+	// Rebuild the source in the official layout, without a version file.
+	if err := os.Remove(filepath.Join(opts.RunnerDir, "version")); err != nil {
+		t.Fatal(err)
+	}
+	versioned := filepath.Join(opts.RunnerDir, "bin.2.338.0")
+	if err := os.MkdirAll(versioned, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(opts.RunnerDir, "bin", "Runner.Listener"), filepath.Join(versioned, "Runner.Listener")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(opts.RunnerDir, "bin")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(versioned, filepath.Join(opts.RunnerDir, "bin")); err != nil {
+		t.Fatal(err)
+	}
+
+	l := New(opts)
+	if err := l.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(opts.Dir, "bin", "Runner.Listener")
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("bin/Runner.Listener missing from the lane: %v", err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("lane copy is not a regular file: %v", info.Mode())
+	}
+}
+
+// TestEnvKeepsTheUserBus: systemd-run --user finds the user manager only
+// through XDG_RUNTIME_DIR.
+func TestEnvKeepsTheUserBus(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+	l := New(testOptions(t, &fakeExec{}))
+	for _, kv := range l.env() {
+		if kv == "XDG_RUNTIME_DIR=/run/user/1000" {
+			return
+		}
+	}
+	t.Fatal("env drops XDG_RUNTIME_DIR; systemd-run --user cannot connect to the bus")
+}
+
+// TestPrepareCopiesEveryTopLevelFile: run.sh sources run-helper.sh.template and
+// safe_sleep.sh from its own directory. A copy that lists only config.sh and
+// run.sh makes the runner exit 0 before it ever listens.
+func TestPrepareCopiesEveryTopLevelFile(t *testing.T) {
+	opts := testOptions(t, &fakeExec{})
+	l := New(opts)
+	if err := l.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"config.sh", "run.sh", "run-helper.sh.template", "safe_sleep.sh"} {
+		if _, err := os.Stat(filepath.Join(opts.Dir, name)); err != nil {
+			t.Fatalf("%s missing from the lane: %v", name, err)
+		}
+	}
+	for _, name := range []string{".runner", ".runner_migrated", ".credentials", ".path", "actions-runner.tar.gz"} {
+		if _, err := os.Stat(filepath.Join(opts.Dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s leaked from the source install into the lane", name)
+		}
+	}
+}
+
+// TestPrepareDropsThePreviousRegistration: config.sh refuses to run while
+// .runner exists, and a killed supervisor always leaves one behind.
+func TestPrepareDropsThePreviousRegistration(t *testing.T) {
+	opts := testOptions(t, &fakeExec{})
+	l := New(opts)
+	if err := l.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	stale := map[string]string{".runner": "{}", ".runner_migrated": "{}", ".credentials": "{}", ".credentials_rsaparams": "key"}
+	for name, body := range stale {
+		if err := os.WriteFile(filepath.Join(opts.Dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	for name := range stale {
+		if _, err := os.Stat(filepath.Join(opts.Dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s survived Prepare; the next config.sh fails with 'already configured'", name)
+		}
 	}
 }
 

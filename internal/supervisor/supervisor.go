@@ -48,6 +48,9 @@ func New(opts Options) (*Supervisor, error) {
 	if opts.Metrics == nil {
 		opts.Metrics = metrics.New()
 	}
+	if opts.Exec == nil {
+		opts.Exec = lane.OS{}
+	}
 	scope, err := config.ParseScope(opts.Config.Pool.RunnerURL)
 	if err != nil {
 		return nil, err

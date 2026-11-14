@@ -149,6 +149,20 @@ func (l *Lane) Current() State {
 	return State{Unit: l.unit, RunnerName: l.runnerName, Attempt: l.attempt, StartedAt: l.startedAt}
 }
 
+// runnerStateFiles are per-install state, never part of a lane copy: config.sh
+// refuses to run while .runner or its pre-migration name exists, and .env/.path
+// describe the source install's user and PATH. config.sh writes both again.
+var runnerStateFiles = map[string]bool{
+	".runner":                true,
+	".runner_migrated":       true,
+	".credentials":           true,
+	".credentials_migrated":  true,
+	".credentials_rsaparams": true,
+	".env":                   true,
+	".path":                  true,
+	".service":               true,
+}
+
 // Prepare creates the lane's private directory tree. Each lane needs its own
 // copy: .runner, .credentials and _work are not safe to share between runner
 // processes. Files are hardlinked, so the copy costs almost no disk.
@@ -164,18 +178,44 @@ func (l *Lane) Prepare() error {
 			return err
 		}
 	}
+	if err := l.clearStaleRegistration(); err != nil {
+		return err
+	}
 	return l.syncRunnerTree()
+}
+
+// clearStaleRegistration drops the previous attempt's identity. config.sh
+// refuses to run while .runner exists ("already configured"), and every
+// interrupted attempt leaves one behind: the supervisor is killed, not the
+// runner. Each attempt registers under a fresh name, so the old one is dead.
+func (l *Lane) clearStaleRegistration() error {
+	for name := range runnerStateFiles {
+		if err := os.Remove(filepath.Join(l.opts.Dir, name)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (l *Lane) homeDir() string   { return filepath.Join(l.opts.Dir, "home") }
 func (l *Lane) statePath() string { return filepath.Join(l.opts.StateDir, "lane.json") }
 
+// isLaunchFile reports whether a top-level file belongs to the runner program.
+// The release ships shell scripts and templates; an install also collects
+// tarballs, backups and other leftovers that must not reach every lane.
+func isLaunchFile(name string) bool {
+	switch filepath.Ext(name) {
+	case ".sh", ".cmd", ".template":
+		return true
+	}
+	return name == "version"
+}
+
 // syncRunnerTree hardlinks the runner install into the lane. A version change
 // in the source wipes the lane copy first, because a half-upgraded runner
 // fails in ways that look like flaky jobs.
 func (l *Lane) syncRunnerTree() error {
-	version, _ := os.ReadFile(filepath.Join(l.opts.RunnerDir, "version"))
-	stamp := strings.TrimSpace(string(version))
+	stamp := l.sourceStamp()
 	markerPath := filepath.Join(l.opts.Dir, ".runlet-runner-version")
 	if old, err := os.ReadFile(markerPath); err == nil && strings.TrimSpace(string(old)) == stamp && stamp != "" {
 		return nil
@@ -186,8 +226,19 @@ func (l *Lane) syncRunnerTree() error {
 	if err := os.RemoveAll(filepath.Join(l.opts.Dir, "externals")); err != nil {
 		return err
 	}
-	for _, name := range []string{"config.sh", "run.sh"} {
-		if err := copyFile(filepath.Join(l.opts.RunnerDir, name), filepath.Join(l.opts.Dir, name)); err != nil {
+	entries, err := os.ReadDir(l.opts.RunnerDir)
+	if err != nil {
+		return err
+	}
+	// Every launch file is part of the install: run.sh needs
+	// run-helper.sh.template and safe_sleep.sh next to itself, and a missing
+	// helper makes the runner exit 0 before it ever listens.
+	for _, e := range entries {
+		if !e.Type().IsRegular() || runnerStateFiles[e.Name()] || !isLaunchFile(e.Name()) {
+			continue
+		}
+		src := filepath.Join(l.opts.RunnerDir, e.Name())
+		if err := copyFile(src, filepath.Join(l.opts.Dir, e.Name())); err != nil {
 			return err
 		}
 	}
@@ -197,6 +248,22 @@ func (l *Lane) syncRunnerTree() error {
 		}
 	}
 	return os.WriteFile(markerPath, []byte(stamp+"\n"), 0o644)
+}
+
+// sourceStamp identifies the runner build. The official layout has a version
+// file; an install that came from the tarball may not, so the listener's size
+// and mtime stand in for it.
+func (l *Lane) sourceStamp() string {
+	if raw, err := os.ReadFile(filepath.Join(l.opts.RunnerDir, "version")); err == nil {
+		if v := strings.TrimSpace(string(raw)); v != "" {
+			return v
+		}
+	}
+	info, err := os.Stat(filepath.Join(l.opts.RunnerDir, "bin", "Runner.Listener"))
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%d-%d", info.Size(), info.ModTime().Unix())
 }
 
 func copyFile(src, dst string) error {
@@ -213,13 +280,18 @@ func copyFile(src, dst string) error {
 
 // linkTree hardlinks every regular file. A hardlink shares one inode: the lane
 // cannot corrupt it, and no disk is spent. Filesystems without hardlinks fall
-// back to a copy.
+// back to a copy. The installed runner keeps bin and externals as symlinks to
+// versioned directories, so the root is resolved first.
 func linkTree(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+	root, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		return err
+	}
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(src, path)
+		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}
@@ -421,7 +493,13 @@ func (l *Lane) env() []string {
 		"PATH=" + os.Getenv("PATH"),
 		"LANG=C.UTF-8",
 	}
-	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"} {
+	for _, k := range []string{
+		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+		// systemd-run --user and systemctl --user find the user manager through
+		// the runtime directory. Without it they fail with "Failed to connect to
+		// bus: No medium found".
+		"XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+	} {
 		if v, ok := os.LookupEnv(k); ok {
 			env = append(env, k+"="+v)
 		}
