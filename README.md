@@ -2,11 +2,13 @@
 
 A single-host scheduler for self-hosted GitHub Actions runners.
 
-`runlet` does two things:
+`runlet` does three things:
 
-- **P1 (this release):** cancel queued runs that a newer run on the same branch
-  has superseded.
-- **P2 (next):** run N resource-capped runner lanes from one binary.
+- **Cancellation:** cancel queued runs that a newer run on the same branch has
+  superseded.
+- **Lanes:** run N resource-capped runner processes from one binary (P2).
+- **Reporting:** queue depth, oldest queued run, and lane state on `/metrics`
+  and `/status`.
 
 `runlet` does not reorder GitHub's queue. Self-hosted runners pull jobs, and no
 API lets an outside process see or reorder that queue. `runlet` controls three
@@ -32,8 +34,8 @@ a run waited, only the newest run can produce a useful result.
 
 ## Status
 
-P1. The policy controller works and defaults to `dry-run`. Lane management is
-not in this build.
+P1 and P2. The policy controller works and defaults to `dry-run`. The lane
+supervisor runs when `pool.lanes` is configured.
 
 ## Build
 
@@ -75,12 +77,17 @@ authentication, so binding to a LAN address is rejected at startup.
 A dry-run token needs read access to Actions. `apply` needs write access to
 cancel runs.
 
+Lanes need a second token that can mint registration tokens: `RUNLET_ADMIN_TOKEN`
+in the same env file. Keep the admin token out of every other use.
+
 ## Commands
 
 ```sh
 runlet doctor                       # token, API reachability, delegation, memory
-runlet status                       # queue depth and oldest queued run per repo
+runlet status                       # queue depth, oldest queued run, lane state
 runlet serve                        # poll and act; dry-run unless mode: apply
+runlet drain                        # let running jobs finish, start no new lane
+runlet drain -off                   # resume starting lanes
 runlet policy check SNAPSHOT        # replay a recorded snapshot, print decisions
 ```
 
@@ -94,6 +101,37 @@ repos:
       - {id: 1, workflow_id: 9, head_branch: feat, event: pull_request,
          status: queued, created_at: 2026-11-14T11:40:00Z}
 ```
+
+## Lanes
+
+Set `pool.lanes` to run runner processes. Each lane is its own runner
+registration, its own directory, and its own systemd scope:
+
+- The runner install in `pool.runner_dir` is hardlinked into each lane. One
+  inode per file, so a second lane costs almost no disk.
+- Each lane gets its own `HOME`, `.runner`, `.credentials`, and `_work`. Those
+  are not safe to share between runner processes.
+- `GOCACHE`, `GOMODCACHE`, and `PNPM_STORE_DIR` point at one shared cache, so
+  two lanes do not re-download the same modules.
+- `systemd-run --user --scope` sets `MemoryMax`, `MemoryHigh`, and `CPUQuota`.
+  `KillMode=control-group` stops a job's child processes with the lane.
+- Runner names are unique per attempt, so two overlapping attempts cannot
+  de-register each other.
+- Registrations are ephemeral: each lane takes one job, exits, and is cleaned
+  up. `_work/_actions` survives, because that is the action cache.
+
+Start lanes only when the host has memory to spare:
+
+```sh
+runlet doctor    # fails when MemAvailable is below pool.memory_budget
+```
+
+Two lanes on a host that is already swapping trades a queue for an OOM kill of
+something else on the machine. `runlet doctor` checks this; do not raise
+`pool.lanes` to meet a deadline.
+
+On restart, the supervisor adopts live `runlet-lane-*` scopes instead of starting
+duplicates, and a lock file stops a second supervisor.
 
 ## Safety
 
@@ -125,7 +163,9 @@ repos:
 - `runlet` cannot preempt a job that GitHub already assigned.
 - Identical-label lanes add concurrency, not priority. Priority requires
   partitioned labels and a `runs-on` change in each workflow.
-- P1 does not manage runners.
+- GitHub has no REST endpoint that cancels a single job. When a lane dies
+  mid-job, runlet logs the runner name and relies on GitHub's own runner-loss
+  detection.
 
 ## License
 

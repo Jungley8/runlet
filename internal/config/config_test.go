@@ -19,6 +19,8 @@ policy:
 pool:
   state_dir: /tmp/runlet-state
   work_dir: /tmp/runlet-work
+  runner_dir: RUNNER_DIR_PLACEHOLDER
+  runner_url: "https://github.com/your-org"
   memory_budget: 3.5GiB
   lanes:
     - name: lane-0
@@ -31,8 +33,25 @@ repos:
     cancel_superseded: true
 `
 
+// fakeRunnerDir is the shape checkRunnerDir expects from an extracted runner.
+func fakeRunnerDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, name := range []string{"config.sh", "run.sh", filepath.Join("bin", "Runner.Listener")} {
+		full := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
 func writeTemp(t *testing.T, body string) string {
 	t.Helper()
+	body = strings.ReplaceAll(body, "RUNNER_DIR_PLACEHOLDER", fakeRunnerDir(t))
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -112,6 +131,8 @@ func TestValidateRejects(t *testing.T) {
 		{"duplicate repo", validYAML + "  - slug: octarq-org/octarq-pro\n    cancel_superseded: true\n", "listed twice"},
 		{"all interfaces", strings.Replace(validYAML, `listen: "127.0.0.1:9464"`, `listen: "0.0.0.0:9464"`, 1), "loopback"},
 		{"not host:port", strings.Replace(validYAML, `listen: "127.0.0.1:9464"`, `listen: "127.0.0.1"`, 1), "host:port"},
+		{"runner url not https", strings.Replace(validYAML, `runner_url: "https://github.com/your-org"`, `runner_url: "http://github.com/your-org"`, 1), "must use https"},
+		{"runner dir missing", strings.Replace(validYAML, "RUNNER_DIR_PLACEHOLDER", "/nonexistent-runner", 1), "pool.runner_dir"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -161,6 +182,36 @@ func TestResolveTokenChecksFilePermissions(t *testing.T) {
 	}
 	if _, err := ResolveToken(path); err == nil || !strings.Contains(err.Error(), "0600") {
 		t.Fatalf("want 0600 error, got %v", err)
+	}
+}
+
+func TestParseScope(t *testing.T) {
+	cases := map[string]struct {
+		path string
+		ok   bool
+	}{
+		"https://github.com/acme":       {"/orgs/acme/actions/runners", true},
+		"https://github.com/acme/repo":  {"/repos/acme/repo/actions/runners", true},
+		"acme":                          {"/orgs/acme/actions/runners", true},
+		"acme/repo":                     {"/repos/acme/repo/actions/runners", true},
+		"http://github.com/acme":        {"", false},
+		"https://github.com/a/b/c":      {"", false},
+		"https://gitlab.example/acme/x": {"/repos/acme/x/actions/runners", true},
+	}
+	for in, want := range cases {
+		scope, err := ParseScope(in)
+		if want.ok && err != nil {
+			t.Fatalf("%q: %v", in, err)
+		}
+		if !want.ok {
+			if err == nil {
+				t.Fatalf("%q: want an error", in)
+			}
+			continue
+		}
+		if got := scope.APIPath(); got != want.path {
+			t.Fatalf("%q = %q, want %q", in, got, want.path)
+		}
 	}
 }
 

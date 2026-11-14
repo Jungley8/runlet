@@ -49,3 +49,20 @@ type Runner struct {
 	Status string `json:"status"` // online | offline
 	Busy   bool   `json:"busy"`
 }
+
+// RegistrationToken registers exactly one runner and expires after an hour.
+type RegistrationToken struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// Job is one job of a run. runner_name is how a supervisor learns which lane
+// was executing a job when that lane died.
+type Job struct {
+	ID         int64  `json:"id"`
+	RunID      int64  `json:"run_id"`
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	RunnerName string `json:"runner_name"`
+	HTMLURL    string `json:"html_url"`
+}

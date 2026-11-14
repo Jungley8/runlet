@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -39,6 +40,30 @@ func ResolveToken(envPath string) (string, error) {
 // read. A token that is group- or world-readable is a misconfiguration, not a
 // warning.
 func LoadTokenFile(path string) (string, error) {
+	return loadKey(path, "RUNLET_TOKEN", "GITHUB_TOKEN")
+}
+
+// ResolveAdminToken returns the credential used to mint registration tokens.
+// It is a separate variable so the long-lived admin token is not the one used
+// on every poll.
+func ResolveAdminToken(envPath string) (string, error) {
+	if envPath != "" {
+		if info, err := os.Stat(envPath); err == nil {
+			if perm := info.Mode().Perm(); perm&0o077 != 0 {
+				return "", fmt.Errorf("token file %s must be mode 0600 (is %04o)", envPath, perm)
+			}
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("RUNLET_ADMIN_TOKEN")); v != "" {
+		return v, nil
+	}
+	if envPath == "" {
+		return "", errors.New("no admin token: set RUNLET_ADMIN_TOKEN")
+	}
+	return loadKey(envPath, "RUNLET_ADMIN_TOKEN")
+}
+
+func loadKey(path string, keys ...string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", fmt.Errorf("token file: %w", err)
@@ -63,7 +88,7 @@ func LoadTokenFile(path string) (string, error) {
 		if !ok {
 			continue
 		}
-		if strings.TrimSpace(k) != "RUNLET_TOKEN" && strings.TrimSpace(k) != "GITHUB_TOKEN" {
+		if !slices.Contains(keys, strings.TrimSpace(k)) {
 			continue
 		}
 		if v = strings.Trim(strings.TrimSpace(v), `"'`); v != "" {
@@ -73,5 +98,5 @@ func LoadTokenFile(path string) (string, error) {
 	if err := sc.Err(); err != nil {
 		return "", fmt.Errorf("read token file: %w", err)
 	}
-	return "", fmt.Errorf("no GITHUB_TOKEN in %s", path)
+	return "", fmt.Errorf("no %s in %s", keys[0], path)
 }

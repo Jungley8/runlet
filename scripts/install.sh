@@ -23,7 +23,7 @@ fi
 
 if [ ! -f "${CONF_DIR}/env" ]; then
   install -m 0600 /dev/null "${CONF_DIR}/env"
-  echo "wrote an empty ${CONF_DIR}/env; add GITHUB_TOKEN=..."
+  echo "wrote an empty ${CONF_DIR}/env; add GITHUB_TOKEN=... (and RUNLET_ADMIN_TOKEN=... when pool.lanes is set)"
 fi
 
 if command -v loginctl >/dev/null 2>&1; then

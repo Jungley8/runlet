@@ -228,10 +228,22 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 }
 
 func (c *Client) post(ctx context.Context, path string) error {
+	return c.write(ctx, http.MethodPost, path, nil)
+}
+
+func (c *Client) postJSON(ctx context.Context, path string, out any) error {
+	return c.write(ctx, http.MethodPost, path, out)
+}
+
+func (c *Client) delete(ctx context.Context, path string) error {
+	return c.write(ctx, http.MethodDelete, path, nil)
+}
+
+func (c *Client) write(ctx context.Context, method, path string, out any) error {
 	if c.baseErr != nil {
 		return c.baseErr
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, nil)
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, nil)
 	if err != nil {
 		return err
 	}
@@ -246,8 +258,14 @@ func (c *Client) post(ctx context.Context, path string) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return parseAPIError(resp)
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
-	return nil
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	if err != nil {
+		return err
+	}
+	if out == nil || len(body) == 0 {
+		return nil
+	}
+	return json.Unmarshal(body, out)
 }
 
 func (c *Client) setHeaders(req *http.Request) {

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -68,8 +70,14 @@ func (p PolicyConfig) Grace() time.Duration {
 }
 
 type PoolConfig struct {
-	StateDir     string       `yaml:"state_dir"`
-	WorkDir      string       `yaml:"work_dir"`
+	StateDir string `yaml:"state_dir"`
+	WorkDir  string `yaml:"work_dir"`
+	// RunnerDir is an extracted actions-runner release. runlet copies it into
+	// each lane; it never writes to the source.
+	RunnerDir string `yaml:"runner_dir"`
+	// RunnerURL is the registration scope: https://github.com/owner or
+	// https://github.com/owner/repo.
+	RunnerURL    string       `yaml:"runner_url"`
 	MemoryBudget Bytes        `yaml:"memory_budget"`
 	Lanes        []LaneConfig `yaml:"lanes"`
 }
@@ -88,6 +96,7 @@ type RepoConfig struct {
 }
 
 var slugRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+var slugPartRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 // loopbackHosts is an allowlist, not a check for a private range. A LAN address
 // is still reachable by every device on the network.
@@ -195,6 +204,16 @@ func (c *Config) Validate() error {
 		if strings.TrimSpace(c.Pool.WorkDir) == "" {
 			errs = append(errs, errors.New("pool.work_dir is required when lanes are configured"))
 		}
+		if strings.TrimSpace(c.Pool.RunnerDir) == "" {
+			errs = append(errs, errors.New("pool.runner_dir is required when lanes are configured"))
+		} else if err := checkRunnerDir(c.Pool.RunnerDir); err != nil {
+			errs = append(errs, err)
+		}
+		if strings.TrimSpace(c.Pool.RunnerURL) == "" {
+			errs = append(errs, errors.New("pool.runner_url is required when lanes are configured"))
+		} else if _, err := ParseScope(c.Pool.RunnerURL); err != nil {
+			errs = append(errs, err)
+		}
 		if c.Pool.MemoryBudget <= 0 {
 			errs = append(errs, errors.New("pool.memory_budget is required when lanes are configured"))
 		} else if total > c.Pool.MemoryBudget {
@@ -203,4 +222,70 @@ func (c *Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// checkRunnerDir proves the directory is an extracted runner before a lane
+// tries to run it. A missing config.sh is a confusing failure 30 seconds later.
+func checkRunnerDir(dir string) error {
+	for _, name := range []string{"config.sh", "run.sh", filepath.Join("bin", "Runner.Listener")} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			return fmt.Errorf("pool.runner_dir %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// CheckRunnerDir is checkRunnerDir for `runlet doctor`.
+func CheckRunnerDir(dir string) error { return checkRunnerDir(dir) }
+
+// Scope is an organization or repository that owns runners.
+type Scope struct {
+	Owner string
+	Repo  string // empty for an organization scope
+}
+
+// ParseScope accepts https://github.com/owner, https://github.com/owner/repo,
+// and the bare owner or owner/repo forms.
+func ParseScope(raw string) (Scope, error) {
+	s := strings.TrimSpace(raw)
+	if strings.Contains(s, "://") {
+		u, err := url.Parse(s)
+		if err != nil {
+			return Scope{}, fmt.Errorf("pool.runner_url %q: %w", raw, err)
+		}
+		if u.Scheme != "https" {
+			return Scope{}, fmt.Errorf("pool.runner_url %q must use https", raw)
+		}
+		s = strings.Trim(u.Path, "/")
+	}
+	parts := strings.Split(s, "/")
+	switch len(parts) {
+	case 1:
+		if !slugPartRE.MatchString(parts[0]) {
+			return Scope{}, fmt.Errorf("pool.runner_url %q: %q is not an owner name", raw, parts[0])
+		}
+		return Scope{Owner: parts[0]}, nil
+	case 2:
+		if !slugPartRE.MatchString(parts[0]) || !slugPartRE.MatchString(parts[1]) {
+			return Scope{}, fmt.Errorf("pool.runner_url %q: want owner/repo", raw)
+		}
+		return Scope{Owner: parts[0], Repo: parts[1]}, nil
+	default:
+		return Scope{}, fmt.Errorf("pool.runner_url %q: want https://github.com/owner or https://github.com/owner/repo", raw)
+	}
+}
+
+func (s Scope) String() string {
+	if s.Repo == "" {
+		return s.Owner
+	}
+	return s.Owner + "/" + s.Repo
+}
+
+// APIPath is the REST prefix for this scope's runners and registration tokens.
+func (s Scope) APIPath() string {
+	if s.Repo == "" {
+		return "/orgs/" + s.Owner + "/actions/runners"
+	}
+	return "/repos/" + s.Owner + "/" + s.Repo + "/actions/runners"
 }

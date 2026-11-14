@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,14 +18,17 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/Jungley8/runlet/internal/config"
 	"github.com/Jungley8/runlet/internal/ghapi"
+	"github.com/Jungley8/runlet/internal/lane"
 	"github.com/Jungley8/runlet/internal/metrics"
 	"github.com/Jungley8/runlet/internal/policy"
 	"github.com/Jungley8/runlet/internal/serve"
+	"github.com/Jungley8/runlet/internal/supervisor"
 	"gopkg.in/yaml.v3"
 )
 
@@ -45,6 +49,8 @@ func main() {
 		err = cmdStatus(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
+	case "drain":
+		err = cmdDrain(os.Args[2:])
 	case "policy":
 		err = cmdPolicy(os.Args[2:])
 	case "version", "-version", "--version":
@@ -67,9 +73,10 @@ func usage() {
 	fmt.Fprint(os.Stderr, `runlet — single-host GitHub Actions runner scheduler
 
 Usage:
-  runlet serve   [-config PATH]        run the policy controller and metrics endpoint
-  runlet status  [-config PATH]        print queue depth for the configured repos
+  runlet serve   [-config PATH]        run the policy controller and the lanes
+  runlet status  [-config PATH]        print queue depth and lane state
   runlet doctor  [-config PATH]        check token, API, cgroup delegation, memory
+  runlet drain   [-off]                stop starting new lane attempts; -off resumes
   runlet policy check SNAPSHOT         replay a recorded snapshot through the policy
   runlet version
 
@@ -109,7 +116,8 @@ func cmdServe(args []string) error {
 	}
 
 	log := newLogger()
-	log.Info("starting", "mode", cfg.Policy.ModeValue(), "repos", len(cfg.Repos), "poll", cfg.Policy.PollEvery().String())
+	log.Info("starting", "mode", cfg.Policy.ModeValue(), "repos", len(cfg.Repos),
+		"poll", cfg.Policy.PollEvery().String(), "lanes", len(cfg.Pool.Lanes))
 	if cfg.Policy.ModeValue() == "dry-run" {
 		log.Info("dry-run: decisions are logged, no run is cancelled")
 	}
@@ -117,6 +125,24 @@ func cmdServe(args []string) error {
 	killSwitch := filepath.Join(defaultDir(), "KILL")
 	if cfg.Pool.StateDir != "" {
 		killSwitch = filepath.Join(cfg.Pool.StateDir, "KILL")
+	}
+
+	// Build the supervisor before any goroutine starts: a missing admin token
+	// must stop the process, not half of it.
+	var sup *supervisor.Supervisor
+	if len(cfg.Pool.Lanes) > 0 {
+		admin, err := config.ResolveAdminToken(defaultEnvPath())
+		if err != nil {
+			return err
+		}
+		sup, err = supervisor.New(supervisor.Options{
+			Config: cfg,
+			Client: ghapi.New(admin),
+			Log:    log,
+		})
+		if err != nil {
+			return err
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -129,7 +155,25 @@ func cmdServe(args []string) error {
 		Log:        log,
 		KillSwitch: killSwitch,
 	})
-	return srv.Serve(ctx)
+
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	run := func(f func() error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- f()
+		}()
+	}
+	run(func() error { return srv.Serve(ctx) })
+	if sup != nil {
+		run(func() error { return sup.Run(ctx) })
+	}
+
+	err = <-errs
+	stop()
+	wg.Wait()
+	return err
 }
 
 func cmdStatus(args []string) error {
@@ -177,12 +221,63 @@ func cmdStatus(args []string) error {
 
 	if len(cfg.Pool.Lanes) > 0 {
 		fmt.Println()
-		fmt.Printf("%-20s %-28s %10s %8s\n", "LANE", "LABELS", "MEMORY", "CPU")
+		fmt.Printf("%-16s %-30s %10s %8s %s\n", "LANE", "LABELS", "MEMORY", "CPU", "RUNNING")
 		for _, l := range cfg.Pool.Lanes {
-			fmt.Printf("%-20s %-28s %10s %8s\n", l.Name, strings.Join(l.Labels, ","), l.Memory, l.CPUQuota)
+			running := "-"
+			if st, ok := laneState(cfg, l.Name); ok {
+				running = fmt.Sprintf("%s up %s", st.RunnerName, time.Since(st.StartedAt).Truncate(time.Second))
+			}
+			fmt.Printf("%-16s %-30s %10s %8s %s\n", l.Name, strings.Join(l.Labels, ","), l.Memory, l.CPUQuota, running)
 		}
 	}
 	return firstErr
+}
+
+func laneState(cfg *config.Config, name string) (lane.State, bool) {
+	raw, err := os.ReadFile(filepath.Join(cfg.Pool.StateDir, "lanes", name, "lane.json"))
+	if err != nil {
+		return lane.State{}, false
+	}
+	var st lane.State
+	if err := json.Unmarshal(raw, &st); err != nil || st.RunnerName == "" {
+		return lane.State{}, false
+	}
+	return st, true
+}
+
+// cmdDrain stops new lane attempts without a restart. An ephemeral runner
+// finishes its current job, so this drains instead of killing work.
+func cmdDrain(args []string) error {
+	fs := flag.NewFlagSet("drain", flag.ContinueOnError)
+	cfgPath := fs.String("config", defaultConfigPath(), "config file")
+	off := fs.Bool("off", false, "clear the drain flag")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	dir := cfg.Pool.StateDir
+	if dir == "" {
+		dir = defaultDir()
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "DRAIN")
+	if *off {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		fmt.Println("drain cleared: new lane attempts will start")
+		return nil
+	}
+	if err := os.WriteFile(path, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
+		return err
+	}
+	fmt.Println("draining: running jobs finish, no new lane attempt starts")
+	return nil
 }
 
 func cmdDoctor(args []string) error {
@@ -220,6 +315,12 @@ func cmdDoctor(args []string) error {
 			fmt.Printf("      rate limit: %d/%d remaining, resets %s\n",
 				rl.Remaining, rl.Limit, rl.Reset.Format(time.RFC3339))
 		}
+	}
+
+	if len(cfg.Pool.Lanes) > 0 {
+		_, err := config.ResolveAdminToken(defaultEnvPath())
+		check("admin token (lanes register runners)", err)
+		check("runner install "+cfg.Pool.RunnerDir, config.CheckRunnerDir(cfg.Pool.RunnerDir))
 	}
 
 	if runtime.GOOS == "linux" {

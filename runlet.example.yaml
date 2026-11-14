@@ -9,11 +9,16 @@ policy:
   cancel_cap_per_hour: 20
   grace_seconds: 45
 
-# P2 reads this block. The P1 controller ignores it.
+# Lanes are P2. Leave the block out to run the policy controller alone.
 # Replace /home/you with your home directory; ~ is not expanded.
 pool:
   state_dir: "/home/you/.local/state/runlet"
   work_dir: "/home/you/lanes"
+  # An extracted actions-runner release. runlet copies it into each lane with
+  # hardlinks and never writes to this directory.
+  runner_dir: "/home/you/actions-runner"
+  # Registration scope: an organization or a repository.
+  runner_url: "https://github.com/your-org"
   memory_budget: "3.5GiB"
   lanes:
     - name: "lane-0"

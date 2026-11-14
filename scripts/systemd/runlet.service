@@ -24,7 +24,7 @@ ProtectKernelModules=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 CapabilityBoundingSet=
 LockPersonality=yes
-MemoryDenyWriteExecute=yes
+# No MemoryDenyWriteExecute: the runner is .NET and JITs its own code.
 
 [Install]
 WantedBy=default.target

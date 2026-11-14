@@ -62,27 +62,40 @@ Before each cancel the caller re-reads **both** runs. The target must still be
 only the target would cancel the last queued run on a branch when the survivor
 finished a second earlier.
 
-## Lane lifecycle (P2)
+## Lane lifecycle
 
 ```
 IDLE → TOKEN → CONFIGURING → LISTENING → RUNNING → DEREGISTERING → CLEANING → IDLE
                         ↘ error → BACKOFF (cap 5m) → IDLE
 ```
 
-- Registration tokens are fetched per cycle. A token older than five minutes is
-  discarded.
+- Registration tokens are minted per attempt and used immediately. A token that
+  expires within a minute is discarded rather than used.
 - Runner names are attempt-unique (`runlet-<host>-lane-<n>-<8hex>`). Reusing a
-  stable name with `--replace` lets two attempts de-register each other.
-- Each lane has its own `HOME`. `.runner`, `.credentials`, and `_work` are not
-  concurrency-safe. Shared caches are injected as `GOCACHE`, `GOMODCACHE`, and
-  `PNPM_STORE_DIR`.
-- Cleanup runs on every exit path: stop the scope, SIGTERM the process group,
-  SIGKILL, deregister, delete `_work` except `_actions`, rotate `_diag`.
-- If the runner dies mid-job, find the assigned job by `runner_name` and cancel
-  it. Otherwise it holds the six-hour job timeout.
-- On startup, adopt live `runlet-lane-*` scopes and stop the rest. After a
-  reboot, delete prefixed registrations that are offline for more than ten
-  minutes.
+  stable name with `--replace` lets two attempts de-register each other, so the
+  flag is never passed.
+- Each lane has its own directory. The runner install is hardlinked in, not
+  copied: `.runner`, `.credentials`, and `_work` are not concurrency-safe, but
+  the binaries are read-only and can share inodes. A version change in the
+  source wipes and relinks the lane copy.
+- Shared caches are injected as `GOCACHE`, `GOMODCACHE`, and `PNPM_STORE_DIR`.
+- The lane runs under `systemd-run --user --scope` with `MemoryMax`,
+  `MemoryHigh`, `CPUQuota`, `KillMode=control-group`, and `TimeoutStopSec=20`.
+- Cancelling the supervisor's context kills `systemd-run`, not the scope, so
+  stop always runs on a fresh context.
+- Cleanup runs on every exit path: stop the scope, delete `_work` except
+  `_actions`, rotate `_diag` older than seven days, delete the registration,
+  drop the state file.
+- A drain flag (`<state_dir>/DRAIN`) stops new attempts without a restart. An
+  ephemeral lane finishes its current job by itself, so drain never kills work.
+- On startup the supervisor adopts live `runlet-lane-*` scopes and waits for
+  them; it never starts a second runner for an occupied slot. A lock file in
+  `state_dir` stops a second supervisor.
+
+GitHub has no REST endpoint that cancels a single job. When a lane dies
+mid-job, runlet records the runner name and leaves the job to GitHub's own
+runner-loss detection. Cancelling the whole run to free one job would destroy
+the sibling jobs that are still healthy.
 
 ## Resource limits
 
@@ -101,7 +114,7 @@ refuses a lane count when `MemAvailable` is below it.
 | P1 | Config, GitHub client, policy engine, dry-run, metrics |
 | P1.5 | `apply` with an hourly cap and an audit log |
 | P2 | Lane supervisor with cgroup caps and ephemeral registration |
-| P3 | Status page, doctor, drain |
+| P3 | Status, doctor, drain |
 | P4 | Packaging and release automation |
 
 ## Failure modes
@@ -112,7 +125,7 @@ refuses a lane count when `MemAvailable` is below it.
 | Wrong cancellation | re-read target and survivor before POST; never target `in_progress` |
 | Token file readable by others | mode 0600 enforced on load and at startup, even under `EnvironmentFile=` |
 | Endpoints exposed on the LAN | `server.listen` must be loopback or startup fails |
-| Orphaned registrations | attempt-unique names, startup adoption, offline sweep |
-| Host OOM | per-lane `MemoryMax`, aggregate budget, `MemoryHigh` |
+| Orphaned registrations | attempt-unique names, startup adoption, deletion by name after every exit |
+| Host OOM | per-lane `MemoryMax`, aggregate budget, `MemoryHigh`, doctor refuses without headroom |
 | Token expiry | fetch per cycle, discard partial credentials, retry once |
 | API rate limit | ETags, 30 s poll, backoff; cancellation pauses |
