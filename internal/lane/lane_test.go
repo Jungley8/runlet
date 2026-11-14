@@ -315,6 +315,28 @@ func TestPrepareDropsThePreviousRegistration(t *testing.T) {
 	}
 }
 
+// TestUnitCommandsUseTheScopeSuffix: systemctl resolves a bare name to
+// .service, so "is-active runlet-lane-0-abcd" always reports inactive and
+// adoption silently skips every live scope.
+func TestUnitCommandsUseTheScopeSuffix(t *testing.T) {
+	exec := &fakeExec{}
+	l := New(testOptions(t, exec))
+	const unit = "runlet-lane-1-abcd1234"
+	l.IsActive(context.Background(), unit)
+	if err := l.Stop(context.Background(), unit); err != nil {
+		t.Fatal(err)
+	}
+	if len(exec.commands) != 2 {
+		t.Fatalf("commands = %d, want 2", len(exec.commands))
+	}
+	for _, c := range exec.commands {
+		joined := strings.Join(c.Args, " ")
+		if !strings.Contains(joined, unit+".scope") {
+			t.Fatalf("%s does not address the scope unit", joined)
+		}
+	}
+}
+
 func TestStateRoundTrip(t *testing.T) {
 	l := New(testOptions(t, &fakeExec{}))
 	st := l.Attempt()

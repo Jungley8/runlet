@@ -35,6 +35,7 @@ type Options struct {
 type Supervisor struct {
 	opts   Options
 	scope  config.Scope
+	host   string
 	lanes  []*lane.Lane
 	drain  string
 	mu     sync.Mutex
@@ -65,6 +66,7 @@ func New(opts Options) (*Supervisor, error) {
 	s := &Supervisor{
 		opts:   opts,
 		scope:  scope,
+		host:   host,
 		drain:  filepath.Join(pool.StateDir, "DRAIN"),
 		limits: make(map[int]string),
 	}
@@ -101,6 +103,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	defer unlock()
 
 	s.adopt(ctx)
+	s.sweepStale(ctx)
 
 	var wg sync.WaitGroup
 	for _, l := range s.lanes {
@@ -117,13 +120,15 @@ func (s *Supervisor) Run(ctx context.Context) error {
 
 // adopt finds lane scopes that are still running. A supervisor restart must not
 // start a second runner for the same slot: two runners with different names
-// both register, and GitHub hands work to both.
+// both register, and GitHub hands work to both. Extra scopes for one slot mean
+// an earlier supervisor left them behind, so keep the newest and stop the rest.
 func (s *Supervisor) adopt(ctx context.Context) {
 	units, err := s.lanes[0].ListUnits(ctx)
 	if err != nil {
 		s.opts.Log.Warn("lane adoption skipped: cannot list units", "err", err)
 		return
 	}
+	found := make(map[int][]string)
 	for _, u := range units {
 		idx, ok := unitIndex(u)
 		if !ok || idx < 0 || idx >= len(s.lanes) {
@@ -132,10 +137,46 @@ func (s *Supervisor) adopt(ctx context.Context) {
 		if !s.lanes[idx].IsActive(ctx, u) {
 			continue
 		}
+		found[idx] = append(found[idx], u)
+	}
+	for idx, list := range found {
+		keep := list[len(list)-1]
+		for _, u := range list[:len(list)-1] {
+			s.opts.Log.Warn("stopping a duplicate lane scope", "lane", s.lanes[idx].Name(), "unit", u)
+			_ = s.lanes[idx].Stop(ctx, u)
+		}
 		s.mu.Lock()
-		s.limits[idx] = u
+		s.limits[idx] = keep
 		s.mu.Unlock()
-		s.opts.Log.Info("adopted a running lane", "lane", s.lanes[idx].Name(), "unit", u)
+		s.opts.Log.Info("adopted a running lane", "lane", s.lanes[idx].Name(), "unit", keep)
+	}
+}
+
+// sweepStale deletes registrations that no live scope owns. A killed or
+// duplicated lane leaves its registration until GitHub times it out, and every
+// one of those can still receive a job.
+func (s *Supervisor) sweepStale(ctx context.Context) {
+	keep := make(map[string]bool)
+	for _, l := range s.lanes {
+		if st, err := l.LoadState(); err == nil {
+			keep[st.RunnerName] = true
+		}
+	}
+	runners, err := s.opts.Client.ListRunners(ctx, s.scope.APIPath())
+	if err != nil {
+		s.opts.Log.Warn("stale registration sweep skipped", "err", err)
+		return
+	}
+	prefix := "runlet-" + s.host + "-lane-"
+	for _, r := range runners {
+		if !strings.HasPrefix(r.Name, prefix) || r.Status != "offline" || keep[r.Name] {
+			continue
+		}
+		if err := s.opts.Client.DeleteRunner(ctx, s.scope.APIPath(), r.ID); err != nil {
+			s.opts.Log.Warn("stale registration sweep failed", "runner", r.Name, "err", err)
+			continue
+		}
+		s.opts.Log.Info("deleted a stale registration", "runner", r.Name, "id", r.ID)
 	}
 }
 

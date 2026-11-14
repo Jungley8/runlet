@@ -14,6 +14,9 @@ ExecStart=%h/.local/bin/runlet serve
 EnvironmentFile=-%h/.config/runlet/env
 Restart=on-failure
 RestartSec=5s
+# Lanes outlive the supervisor by design, so shutdown must not wait for them.
+# The default 90 s ended in SIGKILL, which skipped deregistration.
+TimeoutStopSec=40
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes

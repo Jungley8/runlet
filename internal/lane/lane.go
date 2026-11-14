@@ -418,15 +418,25 @@ func (l *Lane) Stop(ctx context.Context, unit string) error {
 	if unit == "" {
 		return nil
 	}
-	err := l.opts.Exec.Run(ctx, Command{Path: "systemctl", Args: []string{"--user", "stop", unit}})
+	err := l.opts.Exec.Run(ctx, Command{Path: "systemctl", Args: []string{"--user", "stop", scopeName(unit)}})
 	return err
+}
+
+// scopeName is the unit name systemd stores. systemctl resolves a bare name to
+// .service, so a scope has to be addressed with its suffix: "is-active
+// runlet-lane-0-abcd" reports an inactive .service and exits 3.
+func scopeName(unit string) string {
+	if strings.HasSuffix(unit, ".scope") {
+		return unit
+	}
+	return unit + ".scope"
 }
 
 // IsActive reports whether a unit still runs. Adoption uses it.
 func (l *Lane) IsActive(ctx context.Context, unit string) bool {
 	_, err := l.opts.Exec.Output(ctx, Command{
 		Path: "systemctl",
-		Args: []string{"--user", "is-active", "--quiet", unit},
+		Args: []string{"--user", "is-active", "--quiet", scopeName(unit)},
 	})
 	return err == nil
 }

@@ -256,6 +256,51 @@ func TestNewDefaultsTheExecer(t *testing.T) {
 	}
 }
 
+// TestAdoptStopsDuplicateScopes: two live scopes for one slot mean an earlier
+// supervisor left one behind. Keep one, stop the rest, start nothing new.
+func TestAdoptStopsDuplicateScopes(t *testing.T) {
+	exec := &fakeExec{
+		units: "runlet-lane-0-aaaa1111.scope loaded active running x\n" +
+			"runlet-lane-0-bbbb2222.scope loaded active running x\n",
+		active: true,
+	}
+	s := testSupervisor(t, exec, &ghStub{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(exec.find("stop runlet-lane-0-aaaa1111.scope")) != 1 {
+		t.Fatalf("the older scope was not stopped")
+	}
+	if len(exec.find("stop runlet-lane-0-bbbb2222.scope")) != 0 {
+		t.Fatalf("the adopted scope was stopped")
+	}
+	if got := exec.find("config.sh"); len(got) != 0 {
+		t.Fatalf("adoption started %d runners", len(got))
+	}
+}
+
+// TestSweepDeletesOfflineRegistrationsItDoesNotOwn: a killed lane leaves a
+// registration that can still receive a job.
+func TestSweepDeletesOfflineRegistrationsItDoesNotOwn(t *testing.T) {
+	stub := &ghStub{runners: []map[string]any{
+		{"id": 1, "name": "dead", "status": "offline"},
+		{"id": 2, "name": "live", "status": "online"},
+		{"id": 3, "name": "someone-else", "status": "offline"},
+	}}
+	s := testSupervisor(t, &fakeExec{}, stub)
+	stub.runners[0]["name"] = "runlet-" + s.host + "-lane-0-dead"
+	stub.runners[1]["name"] = "runlet-" + s.host + "-lane-1-live"
+
+	s.sweepStale(context.Background())
+
+	if len(stub.deleted) != 1 || stub.deleted[0] != 1 {
+		t.Fatalf("deleted %v, want [1]", stub.deleted)
+	}
+}
+
 func TestUnitIndex(t *testing.T) {
 	cases := map[string]struct {
 		index int
