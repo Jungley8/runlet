@@ -63,6 +63,11 @@ func (c *Client) ListRunJobs(ctx context.Context, slug string, runID int64) ([]m
 	if err := c.getJSON(ctx, path, &resp); err != nil {
 		return nil, err
 	}
+	// A reader that looks for the in-progress job must not mistake an unread
+	// page for "this run has no such job".
+	if len(resp.Jobs) < resp.TotalCount {
+		return nil, fmt.Errorf("job list is incomplete: %d of %d", len(resp.Jobs), resp.TotalCount)
+	}
 	return resp.Jobs, nil
 }
 

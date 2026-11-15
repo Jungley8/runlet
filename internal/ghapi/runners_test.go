@@ -107,3 +107,18 @@ func TestListRunJobs(t *testing.T) {
 		t.Fatalf("path = %s", gotPath)
 	}
 }
+
+// TestListRunJobsRefusesAnIncompleteList: the watchdog reads an absent runner
+// name as "no job here". A missing page must not become that answer.
+func TestListRunJobsRefusesAnIncompleteList(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"total_count":150,"jobs":[
+			{"id":9,"run_id":5,"name":"build","status":"in_progress","runner_name":"runlet-box-lane-0-a"}]}`)
+	}))
+	defer srv.Close()
+
+	_, err := New("tok", WithBaseURL(srv.URL)).ListRunJobs(context.Background(), "o/r", 5)
+	if err == nil {
+		t.Fatal("a job list shorter than total_count must be an error")
+	}
+}
