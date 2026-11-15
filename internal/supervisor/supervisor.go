@@ -170,7 +170,9 @@ const scratchCheck = 10 * time.Minute
 func (s *Supervisor) watchScratch(ctx context.Context) {
 	t := time.NewTicker(scratchCheck)
 	defer t.Stop()
-	var last time.Time // zero: sweep on the first check
+	// The first check runs at startup: the gauge exists from the first scrape,
+	// and a restart is a good moment to clear what a crashed build left.
+	last := s.checkScratch(s.opts.Config.Pool.Scratch, time.Time{}, time.Now())
 	for {
 		select {
 		case <-ctx.Done():
