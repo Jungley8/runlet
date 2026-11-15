@@ -36,6 +36,17 @@ pool:
       memory_high: "2.5GiB"
       cpu_quota: "300%"
 
+  # The temp filesystem builds write to. A tmpfs here spends memory on every
+  # leftover build directory, and a full one fails every lane at once.
+  # The sweep removes directories that match patterns, are older than stale,
+  # and belong to the service user. every: "0s" turns the sweep off.
+  scratch:
+    path: "/tmp"
+    patterns: ["go-build*"]
+    stale: "12h"
+    every: "24h"
+    warn_percent: 85
+
 repos:
   # Only these repositories are touched. A repository that is not listed here is
   # never cancelled, and there is no wildcard.

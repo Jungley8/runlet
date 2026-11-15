@@ -27,6 +27,7 @@ import (
 	"github.com/Jungley8/runlet/internal/lane"
 	"github.com/Jungley8/runlet/internal/metrics"
 	"github.com/Jungley8/runlet/internal/policy"
+	"github.com/Jungley8/runlet/internal/scratch"
 	"github.com/Jungley8/runlet/internal/serve"
 	"github.com/Jungley8/runlet/internal/supervisor"
 	"gopkg.in/yaml.v3"
@@ -240,6 +241,12 @@ func cmdStatus(args []string) error {
 			}
 			fmt.Printf("%-16s %-30s %10s %8s %s\n", l.Name, strings.Join(l.Labels, ","), l.Memory, l.CPUQuota, running)
 		}
+		path := cfg.Pool.Scratch.PathValue()
+		if u, err := scratch.UsageOf(path); err == nil {
+			fmt.Println()
+			fmt.Printf("%-16s %10s %10s %8s\n", "SCRATCH", "USED", "TOTAL", "USED")
+			fmt.Printf("%-16s %10s %10s %7d%%\n", path, config.Bytes(u.Used), config.Bytes(u.Total), int(u.Ratio()*100))
+		}
 	}
 	return firstErr
 }
@@ -351,7 +358,32 @@ func cmdDoctor(args []string) error {
 		fmt.Printf("skip  cgroup delegation (not Linux: %s)\n", runtime.GOOS)
 	}
 
+	if len(cfg.Pool.Lanes) > 0 {
+		printScratch(cfg.Pool.Scratch, &failures)
+	}
+
 	return errors.Join(failures...)
+}
+
+// printScratch reports the shared temp directory. A full one fails builds with
+// an ENOSPC that names whichever step wrote the largest file, so it belongs in
+// the preflight.
+func printScratch(sc config.ScratchConfig, failures *[]error) {
+	path := sc.PathValue()
+	u, err := scratch.UsageOf(path)
+	if err != nil {
+		*failures = append(*failures, err)
+		fmt.Printf("FAIL  scratch %s: %v\n", path, err)
+		return
+	}
+	fmt.Printf("ok    scratch %s\n", path)
+	fmt.Printf("      used: %s of %s (%d%%), warn at %d%%\n",
+		config.Bytes(u.Used), config.Bytes(u.Total), int(u.Ratio()*100), int(sc.WarnRatio()*100))
+	if u.Ratio() >= 0.95 {
+		err := fmt.Errorf("scratch %s is %d%% full; a build that writes a large temporary file will fail", path, int(u.Ratio()*100))
+		*failures = append(*failures, err)
+		fmt.Printf("FAIL  scratch headroom: %v\n", err)
+	}
 }
 
 func cmdPolicy(args []string) error {

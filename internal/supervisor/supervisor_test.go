@@ -729,3 +729,73 @@ func TestNewWarnsWhenMemoryHighIsBelowMemory(t *testing.T) {
 		})
 	}
 }
+
+// TestScratchCheckSweepsOncePerDayAndReportsUsage: the sweep is the repair, the
+// gauge is the signal. The sweep must not run on every check: it walks the
+// shared temp directory.
+func TestScratchCheckSweepsOncePerDayAndReportsUsage(t *testing.T) {
+	s := testSupervisor(t, &fakeExec{}, &ghStub{})
+	dir := t.TempDir()
+	now := time.Now()
+	sc := config.ScratchConfig{Path: dir}
+
+	mkOld := func(name string) string {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		old := now.Add(-13 * time.Hour)
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	stale := mkOld("go-build1")
+	last := s.checkScratch(sc, time.Time{}, now)
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("the first check did not sweep the stale directory: %v", err)
+	}
+	found := false
+	for k := range s.opts.Metrics.Snapshot() {
+		if strings.HasPrefix(k, "runlet_scratch_used_ratio") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the usage gauge was not reported")
+	}
+
+	// Inside the interval the sweep must not run again.
+	again := mkOld("go-build2")
+	if got := s.checkScratch(sc, last, now.Add(time.Hour)); !got.Equal(last) {
+		t.Fatalf("the sweep ran inside its interval")
+	}
+	if _, err := os.Stat(again); err != nil {
+		t.Fatalf("a second sweep ran inside the interval: %v", err)
+	}
+
+	// After the interval it runs again.
+	s.checkScratch(sc, last, now.Add(25*time.Hour))
+	if _, err := os.Stat(again); !os.IsNotExist(err) {
+		t.Fatalf("the sweep did not run after its interval")
+	}
+}
+
+// TestScratchWarnsOncePerCrossing: a warning every ten minutes buries the line
+// that matters.
+func TestScratchWarnsOncePerCrossing(t *testing.T) {
+	var buf bytes.Buffer
+	s := testSupervisor(t, &fakeExec{}, &ghStub{})
+	s.opts.Log = slog.New(slog.NewTextHandler(&buf, nil))
+	dir := t.TempDir()
+	one := 1
+	sc := config.ScratchConfig{Path: dir, WarnPercent: &one}
+
+	now := time.Now()
+	s.checkScratch(sc, now, now)
+	s.checkScratch(sc, now, now.Add(scratchCheck))
+	if got := strings.Count(buf.String(), "scratch is nearly full"); got != 1 {
+		t.Fatalf("warnings = %d, want 1; log: %s", got, buf.String())
+	}
+}

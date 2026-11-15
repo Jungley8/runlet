@@ -120,6 +120,19 @@ registration, its own directory, and its own systemd scope:
 - The `memory.pressure` file in the lane's cgroup shows whether a lane is
   waiting on memory. `systemctl --user show <unit>.scope -p MemoryCurrent`
   shows what it holds.
+- Each lane sets `TMPDIR` to its own directory inside the lane, not the host's
+  `/tmp`. The directory is emptied at the start of every attempt and after
+  every job. When `/tmp` is a tmpfs, a leftover build directory costs memory,
+  and a full one fails every lane at once: the error arrives as `no space left
+  on device` in whichever step writes a large file, not as a build error.
+- `pool.scratch` watches the host temp filesystem anyway, because tools outside
+  the lane write there too. `runlet_scratch_used_ratio` reports the fill level,
+  a warning is logged once per crossing of `warn_percent` (85 by default), and
+  a sweep runs every `every` (24h by default). The sweep removes directories
+  that match `patterns` (`go-build*` by default), are older than `stale` (12h
+  by default), and belong to the service user. It does not follow symlinks and
+  does not touch plain files. `runlet status` and `runlet doctor` print the
+  current usage.
 - The runner install in `pool.runner_dir` is hardlinked into each lane. One
   inode per file, so a second lane costs almost no disk.
 - `pool.runner_dir` must be a complete extracted runner release, or a live

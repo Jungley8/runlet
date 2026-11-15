@@ -22,6 +22,7 @@ import (
 	"github.com/Jungley8/runlet/internal/metrics"
 	"github.com/Jungley8/runlet/internal/model"
 	"github.com/Jungley8/runlet/internal/policy"
+	"github.com/Jungley8/runlet/internal/scratch"
 )
 
 const maxBackoff = 5 * time.Minute
@@ -47,6 +48,10 @@ type Supervisor struct {
 	miss       map[int]time.Time
 	staleAfter time.Duration
 	watchEvery time.Duration
+	// scratchWarned remembers a warning this process already printed, so the
+	// log holds one line per crossing instead of one per check. The scratch
+	// goroutine is its only writer.
+	scratchWarned bool
 }
 
 func New(opts Options) (*Supervisor, error) {
@@ -143,9 +148,73 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			s.watch(ctx)
 		}()
 	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.watchScratch(ctx)
+	}()
 	<-ctx.Done()
 	wg.Wait()
 	return nil
+}
+
+// scratchCheck is how often the temp directory is measured. The gauge is cheap;
+// the sweep runs on its own, much longer, interval.
+const scratchCheck = 10 * time.Minute
+
+// watchScratch reports how full the shared temp directory is, and removes stale
+// build directories from it. A host whose /tmp is a tmpfs loses memory to every
+// interrupted build, and a full tmpfs fails every lane at once: the failure
+// does not look like a build failure, it looks like a mysterious ENOSPC in
+// whichever step happens to write a large file.
+func (s *Supervisor) watchScratch(ctx context.Context) {
+	t := time.NewTicker(scratchCheck)
+	defer t.Stop()
+	var last time.Time // zero: sweep on the first check
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			last = s.checkScratch(s.opts.Config.Pool.Scratch, last, now)
+		}
+	}
+}
+
+// checkScratch runs one measurement and, when due, one sweep. It returns the
+// time of the last sweep.
+func (s *Supervisor) checkScratch(sc config.ScratchConfig, last, now time.Time) time.Time {
+	path := sc.PathValue()
+	if every := sc.EveryFor(); every > 0 && (last.IsZero() || now.Sub(last) >= every) {
+		removed, err := scratch.Sweep(path, sc.PatternValues(), sc.StaleFor(), now)
+		switch {
+		case err != nil:
+			s.opts.Log.Warn("scratch sweep skipped", "path", path, "err", err)
+		case removed > 0:
+			s.opts.Log.Info("removed stale build directories from scratch", "path", path, "dirs", removed)
+			s.opts.Metrics.Add("runlet_scratch_removed_total", map[string]string{"path": path}, float64(removed))
+		}
+		// A failed sweep waits for the next interval: a retry loop would walk
+		// the same directory every ten minutes.
+		last = now
+	}
+
+	u, err := scratch.UsageOf(path)
+	if err != nil {
+		s.opts.Log.Warn("scratch usage unavailable", "path", path, "err", err)
+		return last
+	}
+	s.opts.Metrics.Set("runlet_scratch_used_ratio", map[string]string{"path": path}, u.Ratio())
+	if u.Ratio() < sc.WarnRatio() {
+		s.scratchWarned = false
+		return last
+	}
+	if !s.scratchWarned {
+		s.scratchWarned = true
+		s.opts.Log.Warn("scratch is nearly full: the next build that writes a large temporary file will fail",
+			"path", path, "used", u.Used, "total", u.Total, "percent", int(u.Ratio()*100))
+	}
+	return last
 }
 
 func (s *Supervisor) watch(ctx context.Context) {

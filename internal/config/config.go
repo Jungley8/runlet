@@ -84,6 +84,102 @@ type PoolConfig struct {
 	// in-progress job for its runner before the supervisor stops the scope and
 	// kills the process tree. Absent takes 10. An explicit 0 turns it off.
 	StaleLaneMinutes *int `yaml:"stale_lane_minutes,omitempty"`
+	// Scratch is the shared temp directory that build tools write to.
+	Scratch ScratchConfig `yaml:"scratch,omitempty"`
+}
+
+// ScratchConfig watches and trims the temp directory builds write to. A host
+// whose /tmp is a tmpfs spends memory on leftover build directories, and the
+// next build then fails with a full filesystem.
+type ScratchConfig struct {
+	Path        string    `yaml:"path,omitempty"`
+	Patterns    []string  `yaml:"patterns,omitempty"`
+	Stale       *Duration `yaml:"stale,omitempty"`
+	Every       *Duration `yaml:"every,omitempty"`
+	WarnPercent *int      `yaml:"warn_percent,omitempty"`
+}
+
+func (s ScratchConfig) PathValue() string {
+	if s.Path == "" {
+		return "/tmp"
+	}
+	return s.Path
+}
+
+// PatternValues lists the directory names a sweep may remove. The default is
+// what the go command leaves behind after an interrupted build.
+func (s ScratchConfig) PatternValues() []string {
+	if len(s.Patterns) == 0 {
+		return []string{"go-build*"}
+	}
+	return s.Patterns
+}
+
+func (s ScratchConfig) StaleFor() time.Duration {
+	if s.Stale == nil {
+		return 12 * time.Hour
+	}
+	return s.Stale.Std()
+}
+
+// EveryFor is how often a sweep runs. Zero turns the sweep off; the usage
+// gauge and the warning keep working.
+func (s ScratchConfig) EveryFor() time.Duration {
+	if s.Every == nil {
+		return 24 * time.Hour
+	}
+	return s.Every.Std()
+}
+
+func (s ScratchConfig) WarnRatio() float64 {
+	if s.WarnPercent == nil {
+		return 0.85
+	}
+	return float64(*s.WarnPercent) / 100
+}
+
+// validate refuses a sweep that could remove more than it should. The sweep
+// deletes directories, so a wrong path or a catch-all pattern costs real data.
+func (s ScratchConfig) validate(workDir, stateDir string) []error {
+	var errs []error
+	path := filepath.Clean(s.PathValue())
+	if !filepath.IsAbs(path) {
+		errs = append(errs, fmt.Errorf("pool.scratch.path %q must be absolute", s.PathValue()))
+	} else {
+		for _, own := range []string{workDir, stateDir} {
+			if own == "" {
+				continue
+			}
+			own = filepath.Clean(own)
+			if path == own || strings.HasPrefix(path, own+string(filepath.Separator)) {
+				errs = append(errs, fmt.Errorf("pool.scratch.path %q must not be inside %q: the sweep would delete lane state", path, own))
+			}
+		}
+	}
+	if s.StaleFor() <= 0 {
+		errs = append(errs, errors.New("pool.scratch.stale must be positive"))
+	}
+	if s.EveryFor() < 0 {
+		errs = append(errs, errors.New("pool.scratch.every must not be negative"))
+	}
+	if s.WarnPercent != nil && (*s.WarnPercent <= 0 || *s.WarnPercent > 100) {
+		errs = append(errs, fmt.Errorf("pool.scratch.warn_percent must be between 1 and 100, got %d", *s.WarnPercent))
+	}
+	if s.EveryFor() > 0 {
+		if len(s.PatternValues()) == 0 {
+			errs = append(errs, errors.New("pool.scratch.patterns must not be empty"))
+		}
+		for _, p := range s.PatternValues() {
+			if p == "*" {
+				errs = append(errs, errors.New(`pool.scratch.patterns must not contain "*": the sweep would remove every directory in the path`))
+				continue
+			}
+			if _, err := filepath.Match(p, "probe"); err != nil {
+				errs = append(errs, fmt.Errorf("pool.scratch.patterns %q is not a valid pattern: %w", p, err))
+			}
+		}
+	}
+	return errs
 }
 
 // StaleAfter is how long a lane may stay busy while GitHub has no in-progress
@@ -258,6 +354,7 @@ func (c *Config) Validate() error {
 		if c.Pool.StaleLaneMinutes != nil && *c.Pool.StaleLaneMinutes < 0 {
 			errs = append(errs, fmt.Errorf("pool.stale_lane_minutes must not be negative, got %d", *c.Pool.StaleLaneMinutes))
 		}
+		errs = append(errs, c.Pool.Scratch.validate(c.Pool.WorkDir, c.Pool.StateDir)...)
 	}
 
 	return errors.Join(errs...)

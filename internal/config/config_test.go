@@ -291,3 +291,62 @@ func TestValidateRejectsANegativeStaleWindow(t *testing.T) {
 		t.Fatalf("want a stale_lane_minutes error, got %v", err)
 	}
 }
+
+func TestScratchDefaults(t *testing.T) {
+	var s ScratchConfig
+	if s.PathValue() != "/tmp" {
+		t.Fatalf("path = %q", s.PathValue())
+	}
+	if got := s.PatternValues(); len(got) != 1 || got[0] != "go-build*" {
+		t.Fatalf("patterns = %v", got)
+	}
+	if s.StaleFor() != 12*time.Hour || s.EveryFor() != 24*time.Hour {
+		t.Fatalf("stale = %s, every = %s", s.StaleFor(), s.EveryFor())
+	}
+	if s.WarnRatio() != 0.85 {
+		t.Fatalf("warn = %v", s.WarnRatio())
+	}
+}
+
+// TestScratchSweepRefusesADangerousPattern: the sweep removes directories, and
+// the path it walks is shared with everything else on the host.
+func TestScratchSweepRefusesADangerousPattern(t *testing.T) {
+	for name, pattern := range map[string]string{
+		"catch-all": "*",
+		"bad":       "[",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := &PoolConfig{Scratch: ScratchConfig{Patterns: []string{pattern}}}
+			errs := cfg.Scratch.validate("", "")
+			if len(errs) != 1 {
+				t.Fatalf("errors = %v, want one", errs)
+			}
+			if !strings.Contains(errs[0].Error(), "patterns") {
+				t.Fatalf("error = %v", errs[0])
+			}
+		})
+	}
+}
+
+// TestScratchSweepRefusesTheLaneDirectories: work_dir holds the lanes and their
+// state, so a sweep pointed at it would remove them.
+func TestScratchSweepRefusesTheLaneDirectories(t *testing.T) {
+	cfg := &PoolConfig{Scratch: ScratchConfig{Path: "/srv/runlet/lanes/tmp"}}
+	errs := cfg.Scratch.validate("/srv/runlet/lanes", "/srv/runlet/state")
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "lane state") {
+		t.Fatalf("errors = %v", errs)
+	}
+}
+
+// TestScratchEveryZeroTurnsTheSweepOff: zero is a deliberate choice, and the
+// usage gauge must keep working.
+func TestScratchEveryZeroTurnsTheSweepOff(t *testing.T) {
+	zero := Duration(0)
+	cfg := &PoolConfig{Scratch: ScratchConfig{Path: "/tmp", Every: &zero}}
+	if errs := cfg.Scratch.validate("/srv/lanes", "/srv/state"); len(errs) != 0 {
+		t.Fatalf("errors = %v", errs)
+	}
+	if cfg.Scratch.EveryFor() != 0 {
+		t.Fatalf("every = %s, want 0", cfg.Scratch.EveryFor())
+	}
+}

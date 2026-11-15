@@ -91,6 +91,9 @@ func TestScopeCommandCarriesTheLimits(t *testing.T) {
 		"--property=CPUQuota=250%",
 		"--property=KillMode=control-group",
 		"--setenv=GOCACHE=" + filepath.Join(l.opts.CacheDir, "go-build"),
+		// TMPDIR is the lane's own directory: a shared tmpfs loses RAM to every
+		// interrupted build, and one full tmpfs fails every lane at once.
+		"--setenv=TMPDIR=" + filepath.Join(l.opts.Dir, "tmp"),
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("command missing %q:\n%s", want, joined)
@@ -509,5 +512,77 @@ func TestRunDoesNotHangOnAPipeHeldByAGrandchild(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * waitDelay):
 		t.Fatal("Run blocked on a pipe held open by a grandchild")
+	}
+}
+
+// TestPrepareEmptiesTheLaneTempDirectory: an interrupted build leaves its
+// temporary files behind, and the next attempt must start without them.
+func TestPrepareEmptiesTheLaneTempDirectory(t *testing.T) {
+	opts := testOptions(t, &fakeExec{})
+	l := New(opts)
+	tmp := filepath.Join(opts.Dir, "tmp")
+	if err := os.MkdirAll(filepath.Join(tmp, "go-build999"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temp directory still holds %d entries after Prepare", len(entries))
+	}
+}
+
+// TestPrepareReplacesASymlinkedTempDirectory: the lane is job-writable, so a
+// job can point tmp at a directory outside the lane. Prepare must replace it
+// instead of writing, or deleting, through it.
+func TestPrepareReplacesASymlinkedTempDirectory(t *testing.T) {
+	opts := testOptions(t, &fakeExec{})
+	l := New(opts)
+	outside := t.TempDir()
+	keep := filepath.Join(outside, "keep.txt")
+	if err := os.WriteFile(keep, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(opts.Dir, "tmp")); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("Prepare deleted a file outside the lane: %v", err)
+	}
+	info, err := os.Lstat(filepath.Join(opts.Dir, "tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("tmp is still a symlink after Prepare")
+	}
+}
+
+// TestCleanupEmptiesTheLaneTempDirectory: the job's last writes stay in TMPDIR
+// when the runner exits; a lane that never cleans them grows without bound.
+func TestCleanupEmptiesTheLaneTempDirectory(t *testing.T) {
+	opts := testOptions(t, &fakeExec{})
+	l := New(opts)
+	tmp := filepath.Join(opts.Dir, "tmp")
+	if err := os.MkdirAll(filepath.Join(tmp, "go-build888"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	l.Cleanup(context.Background())
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temp directory still holds %d entries after Cleanup", len(entries))
 	}
 }

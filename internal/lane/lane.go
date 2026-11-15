@@ -182,6 +182,12 @@ func (l *Lane) Prepare() error {
 	if err := os.MkdirAll(l.homeDir(), 0o755); err != nil {
 		return err
 	}
+	if err := ensureRealDir(l.tmpDir()); err != nil {
+		return err
+	}
+	if err := clearDir(l.tmpDir()); err != nil {
+		return err
+	}
 	for _, d := range []string{l.opts.CacheDir + "/go-build", l.opts.CacheDir + "/go-mod", l.opts.CacheDir + "/pnpm", l.opts.StateDir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return err
@@ -215,6 +221,29 @@ func ensureRealDir(path string) error {
 			return err
 		}
 		return os.MkdirAll(path, 0o700)
+	}
+	return nil
+}
+
+// tmpDir is the lane's private TMPDIR. It lives on disk with the lane, so a
+// leftover build directory costs disk instead of the host's memory.
+func (l *Lane) tmpDir() string { return filepath.Join(l.opts.Dir, "tmp") }
+
+// clearDir removes the entries of a real directory. A symlink at the path is
+// replaced, not followed: a job can plant one and make the next attempt delete
+// its target.
+func clearDir(path string) error {
+	if err := ensureRealDir(path); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(path, e.Name())); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -467,6 +496,11 @@ func (l *Lane) Scope(unit string) Command {
 		"--setenv=GOCACHE="+filepath.Join(l.opts.CacheDir, "go-build"),
 		"--setenv=GOMODCACHE="+filepath.Join(l.opts.CacheDir, "go-mod"),
 		"--setenv=PNPM_STORE_DIR="+filepath.Join(l.opts.CacheDir, "pnpm"),
+		// TMPDIR is the lane's own directory, not the host's /tmp. A host whose
+		// /tmp is a tmpfs loses RAM to every interrupted build, and one full
+		// tmpfs fails every lane at once. The lane directory is on disk and is
+		// emptied at the start of each attempt.
+		"--setenv=TMPDIR="+l.tmpDir(),
 		"--working-directory="+l.opts.Dir,
 		filepath.Join(l.opts.Dir, "run.sh"),
 	)
@@ -563,6 +597,9 @@ func (l *Lane) Cleanup(ctx context.Context) {
 		}
 	}
 	rotateDiag(filepath.Join(l.opts.Dir, "_diag"), 7*24*time.Hour)
+	if err := clearDir(l.tmpDir()); err != nil {
+		l.opts.Log.Warn("lane cleanup: temp directory", "lane", l.opts.Name, "err", err)
+	}
 }
 
 func rotateDiag(dir string, maxAge time.Duration) {
