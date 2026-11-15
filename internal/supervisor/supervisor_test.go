@@ -608,6 +608,52 @@ func TestWatchdogStopsNothingWhenTheRepoListIsIncomplete(t *testing.T) {
 	}
 }
 
+// TestWatchdogStopsALaneWhoseRegistrationIsGone: an ephemeral runner deletes
+// its registration when the job ends, and a lane can then sit on a detached
+// process tree with no registration at all. GitHub has nothing to report busy,
+// so the runner list alone can never show it.
+func TestWatchdogStopsALaneWhoseRegistrationIsGone(t *testing.T) {
+	exec := &fakeExec{}
+	stub := &ghStub{}
+	s, st := staleFixture(t, exec, stub)
+	stub.mu.Lock()
+	stub.runners = nil
+	stub.mu.Unlock()
+
+	now := time.Now()
+	s.checkStale(context.Background(), now)
+	if got := exec.find("stop " + st.Unit); len(got) != 0 {
+		t.Fatalf("the watchdog stopped a lane on the first miss")
+	}
+	s.checkStale(context.Background(), now.Add(11*time.Minute))
+	if got := exec.find("stop " + st.Unit); len(got) != 1 {
+		t.Fatalf("stale lane stop calls = %d, want 1", len(got))
+	}
+}
+
+// TestWatchdogLeavesALaneWhoseJobOutlivedItsRegistration: the registration can
+// be deleted while GitHub still has a job in progress for that runner. Stopping
+// the lane there fails the job.
+func TestWatchdogLeavesALaneWhoseJobOutlivedItsRegistration(t *testing.T) {
+	exec := &fakeExec{}
+	stub := &ghStub{}
+	s, st := staleFixture(t, exec, stub)
+	stub.mu.Lock()
+	stub.runners = nil
+	stub.runs = []map[string]any{{"id": 5, "repository": map[string]any{"full_name": "acme/repo"}}}
+	stub.jobs = map[string][]map[string]any{
+		"5": {{"id": 1, "runner_name": st.RunnerName, "status": "in_progress"}},
+	}
+	stub.mu.Unlock()
+
+	now := time.Now()
+	s.checkStale(context.Background(), now)
+	s.checkStale(context.Background(), now.Add(20*time.Minute))
+	if got := exec.find("stop " + st.Unit); len(got) != 0 {
+		t.Fatalf("the watchdog stopped a lane whose job is in progress")
+	}
+}
+
 // TestWatchdogReadsEveryRepository: the job can be in any repository of the
 // organization, not only in the ones the policy allowlists.
 func TestWatchdogReadsEveryRepository(t *testing.T) {

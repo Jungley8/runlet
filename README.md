@@ -132,11 +132,11 @@ registration, its own directory, and its own systemd scope:
   up. `_work/_actions` survives, because that is the action cache.
 - A cancelled job can leave a detached process tree behind. The runner then
   waits for that tree forever and the lane never takes new work. When GitHub
-  reports the runner busy but has no in-progress job for it for
-  `pool.stale_lane_minutes` (10 by default, `0` turns it off), runlet stops the
-  scope. The stop is what kills the tree: `KillMode=control-group` reaches
-  every process left in the cgroup. `runlet_lane_stale_stops_total` counts
-  these.
+  reports the runner busy, or drops its registration, while no in-progress job
+  names it for `pool.stale_lane_minutes` (10 by default, `0` turns it off),
+  runlet stops the scope. The stop is what kills the tree: `KillMode=control-group`
+  reaches every process left in the cgroup. `runlet_lane_stale_stops_total`
+  counts these. An incomplete API answer stops nothing.
 
 Start lanes only when the host has memory to spare:
 

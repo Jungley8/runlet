@@ -55,6 +55,22 @@ func TestListRunnersPaginates(t *testing.T) {
 	}
 }
 
+// TestListRunnersRefusesAnIncompleteList: the stale check reads a missing name
+// as "GitHub has no such runner". A page the client could not read would then
+// look like a lane to stop.
+func TestListRunnersRefusesAnIncompleteList(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"total_count":250,"runners":[
+			{"id":1,"name":"runlet-box-lane-0-a","status":"offline","busy":false}]}`)
+	}))
+	defer srv.Close()
+
+	_, err := New("tok", WithBaseURL(srv.URL)).ListRunners(context.Background(), "/orgs/acme/actions/runners")
+	if err == nil {
+		t.Fatal("a list shorter than total_count must be an error")
+	}
+}
+
 func TestDeleteRunner(t *testing.T) {
 	var gotMethod, gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -439,10 +439,11 @@ func sleep(ctx context.Context, d time.Duration) bool {
 const maxWatchdogRepos = 100
 
 // checkStale stops a lane that GitHub reports busy while no in-progress job
-// claims its runner. A cancelled job can leave a detached process tree behind;
-// the runner then waits for that tree forever, so the lane never takes new
-// work and the tree keeps its memory. Stopping the scope kills the whole
-// cgroup, which is the only thing that reaches a detached grandchild.
+// claims its runner, and a lane whose registration is gone while no job claims
+// it. A cancelled job can leave a detached process tree behind; the runner then
+// waits for that tree forever, so the lane never takes new work and the tree
+// keeps its memory. Stopping the scope kills the whole cgroup, which is the
+// only thing that reaches a detached grandchild.
 func (s *Supervisor) checkStale(ctx context.Context, now time.Time) {
 	if s.staleAfter <= 0 {
 		return
@@ -457,36 +458,38 @@ func (s *Supervisor) checkStale(ctx context.Context, now time.Time) {
 		s.opts.Log.Warn("stale check skipped: list runners failed", "err", err)
 		return
 	}
+	// busy is false for a runner that is registered and waiting for work, and
+	// absent for a runner whose registration is gone.
 	busy := make(map[string]bool, len(runners))
 	for _, r := range runners {
-		if r.Busy {
-			busy[r.Name] = true
-		}
+		busy[r.Name] = r.Busy
 	}
 
-	// The expensive half only runs when one of our lanes is busy, which is the
-	// only case where a job can be missing.
+	// Only lanes that GitHub is not demonstrably using can be stale. The
+	// expensive half of the check runs only when one of those exists.
 	units := s.units()
-	var busyLanes map[int]lane.State
+	var candidates map[int]lane.State
 	for idx, unit := range units {
 		if idx < 0 || idx >= len(s.lanes) {
 			continue
 		}
 		st, err := s.lanes[idx].LoadState()
-		if err != nil || st.Unit != unit || !busy[st.RunnerName] {
+		if err != nil || st.Unit != unit {
+			// No state file while a scope runs means the attempt is between
+			// moments: written before registering, cleared after. Leave it.
+			s.clearMiss(idx)
 			continue
 		}
-		if busyLanes == nil {
-			busyLanes = make(map[int]lane.State)
+		if b, ok := busy[st.RunnerName]; ok && !b {
+			s.clearMiss(idx) // registered and waiting for a job: normal
+			continue
 		}
-		busyLanes[idx] = st
-	}
-	for idx := range units {
-		if _, ok := busyLanes[idx]; !ok {
-			s.clearMiss(idx)
+		if candidates == nil {
+			candidates = make(map[int]lane.State)
 		}
+		candidates[idx] = st
 	}
-	if len(busyLanes) == 0 {
+	if len(candidates) == 0 {
 		return
 	}
 
@@ -496,7 +499,7 @@ func (s *Supervisor) checkStale(ctx context.Context, now time.Time) {
 		return
 	}
 
-	for idx, st := range busyLanes {
+	for idx, st := range candidates {
 		if active[st.RunnerName] {
 			s.clearMiss(idx)
 			continue
@@ -509,9 +512,13 @@ func (s *Supervisor) checkStale(ctx context.Context, now time.Time) {
 		if now.Sub(first) < s.staleAfter {
 			continue
 		}
+		reason := "busy with no job"
+		if _, ok := busy[st.RunnerName]; !ok {
+			reason = "registration gone"
+		}
 		s.opts.Log.Warn("stopping a lane GitHub has no job for",
 			"lane", s.lanes[idx].Name(), "runner", st.RunnerName, "unit", st.Unit,
-			"busy_for", now.Sub(first).Round(time.Second).String())
+			"reason", reason, "for", now.Sub(first).Round(time.Second).String())
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_ = s.lanes[idx].Stop(stopCtx, st.Unit)
 		stopCancel()

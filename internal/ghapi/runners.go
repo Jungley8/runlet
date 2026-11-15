@@ -9,8 +9,11 @@ import (
 
 // ListRunners returns the registrations of one organization or repository.
 // scopePath is config.Scope.APIPath(), e.g. /orgs/acme/actions/runners.
+// A short list is an error, not a shorter list. A caller that treats a missing
+// name as "GitHub has no such runner" would stop the lane that owns it.
 func (c *Client) ListRunners(ctx context.Context, scopePath string) ([]model.Runner, error) {
 	var all []model.Runner
+	total := -1
 	for page := 1; page <= 5; page++ {
 		var resp struct {
 			TotalCount int            `json:"total_count"`
@@ -19,10 +22,14 @@ func (c *Client) ListRunners(ctx context.Context, scopePath string) ([]model.Run
 		if err := c.getJSON(ctx, fmt.Sprintf("%s?per_page=100&page=%d", scopePath, page), &resp); err != nil {
 			return nil, err
 		}
+		total = resp.TotalCount
 		all = append(all, resp.Runners...)
-		if len(resp.Runners) < 100 || len(all) >= resp.TotalCount {
+		if len(resp.Runners) < 100 || len(all) >= total {
 			break
 		}
+	}
+	if total >= 0 && len(all) < total {
+		return nil, fmt.Errorf("runner list is incomplete: %d of %d", len(all), total)
 	}
 	return all, nil
 }
