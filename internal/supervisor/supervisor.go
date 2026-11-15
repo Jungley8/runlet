@@ -432,9 +432,11 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// maxStaleRuns bounds how many in-progress runs the watchdog inspects per
-// check. Each run costs one request, and a healthy pool has one or two.
-const maxStaleRuns = 50
+// maxWatchdogRepos bounds how many repositories one check walks. GitHub has no
+// endpoint that lists the jobs of an organization, so an org-scoped runner
+// needs one runs call per repository. An org larger than this gets no
+// watchdog: guessing would stop a lane that is running a job.
+const maxWatchdogRepos = 100
 
 // checkStale stops a lane that GitHub reports busy while no in-progress job
 // claims its runner. A cancelled job can leave a detached process tree behind;
@@ -461,18 +463,41 @@ func (s *Supervisor) checkStale(ctx context.Context, now time.Time) {
 			busy[r.Name] = true
 		}
 	}
+
+	// The expensive half only runs when one of our lanes is busy, which is the
+	// only case where a job can be missing.
+	units := s.units()
+	var busyLanes map[int]lane.State
+	for idx, unit := range units {
+		if idx < 0 || idx >= len(s.lanes) {
+			continue
+		}
+		st, err := s.lanes[idx].LoadState()
+		if err != nil || st.Unit != unit || !busy[st.RunnerName] {
+			continue
+		}
+		if busyLanes == nil {
+			busyLanes = make(map[int]lane.State)
+		}
+		busyLanes[idx] = st
+	}
+	for idx := range units {
+		if _, ok := busyLanes[idx]; !ok {
+			s.clearMiss(idx)
+		}
+	}
+	if len(busyLanes) == 0 {
+		return
+	}
+
 	active, err := s.activeRunnerNames(checkCtx)
 	if err != nil {
 		s.opts.Log.Warn("stale check skipped: cannot read in-progress jobs", "err", err)
 		return
 	}
 
-	for idx, unit := range s.units() {
-		if idx < 0 || idx >= len(s.lanes) {
-			continue
-		}
-		st, err := s.lanes[idx].LoadState()
-		if err != nil || st.Unit != unit || !busy[st.RunnerName] || active[st.RunnerName] {
+	for idx, st := range busyLanes {
+		if active[st.RunnerName] {
 			s.clearMiss(idx)
 			continue
 		}
@@ -485,10 +510,10 @@ func (s *Supervisor) checkStale(ctx context.Context, now time.Time) {
 			continue
 		}
 		s.opts.Log.Warn("stopping a lane GitHub has no job for",
-			"lane", s.lanes[idx].Name(), "runner", st.RunnerName, "unit", unit,
+			"lane", s.lanes[idx].Name(), "runner", st.RunnerName, "unit", st.Unit,
 			"busy_for", now.Sub(first).Round(time.Second).String())
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		_ = s.lanes[idx].Stop(stopCtx, unit)
+		_ = s.lanes[idx].Stop(stopCtx, st.Unit)
 		stopCancel()
 		s.opts.Metrics.Add("runlet_lane_stale_stops_total", map[string]string{"lane": s.lanes[idx].Name()}, 1)
 		s.clearMiss(idx)
@@ -497,44 +522,50 @@ func (s *Supervisor) checkStale(ctx context.Context, now time.Time) {
 
 // activeRunnerNames asks GitHub which runners are executing a job right now.
 func (s *Supervisor) activeRunnerNames(ctx context.Context) (map[string]bool, error) {
-	var (
-		runs []model.Run
-		err  error
-	)
-	if s.scope.Repo == "" {
-		runs, err = s.opts.Client.ListOrgRuns(ctx, s.scope.Owner, policy.StatusInProgress)
-	} else {
-		runs, err = s.opts.Client.ListRuns(ctx, s.scope.Owner+"/"+s.scope.Repo, policy.StatusInProgress)
-	}
+	slugs, err := s.watchRepos(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]bool, len(runs))
-	for i, r := range runs {
-		if i >= maxStaleRuns {
-			break
-		}
-		slug := r.RepoFullName()
-		if slug == "" {
-			if s.scope.Repo == "" {
-				// An org listing always names its repository. Without one the
-				// job list cannot be queried, and guessing would hide a stale
-				// lane rather than report it.
-				continue
-			}
-			slug = s.scope.Owner + "/" + s.scope.Repo
-		}
-		jobs, err := s.opts.Client.ListRunJobs(ctx, slug, r.ID)
+	out := make(map[string]bool)
+	for _, slug := range slugs {
+		runs, err := s.opts.Client.ListRuns(ctx, slug, policy.StatusInProgress)
 		if err != nil {
 			return nil, err
 		}
-		for _, j := range jobs {
-			if j.RunnerName != "" && j.Status == policy.StatusInProgress {
-				out[j.RunnerName] = true
+		for _, r := range runs {
+			jobs, err := s.opts.Client.ListRunJobs(ctx, slug, r.ID)
+			if err != nil {
+				return nil, err
+			}
+			for _, j := range jobs {
+				if j.RunnerName != "" && j.Status == policy.StatusInProgress {
+					out[j.RunnerName] = true
+				}
 			}
 		}
 	}
 	return out, nil
+}
+
+// watchRepos lists the repositories a check must walk. An incomplete list is an
+// error, not a shorter list: a repository the check cannot see looks exactly
+// like a lane GitHub forgot.
+func (s *Supervisor) watchRepos(ctx context.Context) ([]string, error) {
+	if s.scope.Repo != "" {
+		return []string{s.scope.Owner + "/" + s.scope.Repo}, nil
+	}
+	repos, err := s.opts.Client.ListOrgRepos(ctx, s.scope.Owner, maxWatchdogRepos)
+	if err != nil {
+		return nil, err
+	}
+	total, err := s.opts.Client.OrgRepoCount(ctx, s.scope.Owner)
+	if err != nil {
+		return nil, err
+	}
+	if total != len(repos) {
+		return nil, fmt.Errorf("organization has %d repositories, the token listed %d", total, len(repos))
+	}
+	return repos, nil
 }
 
 func (s *Supervisor) units() map[int]string {

@@ -119,12 +119,6 @@ func (c *Client) ListRuns(ctx context.Context, slug, status string) ([]model.Run
 	return c.listRuns(ctx, "/repos/"+slug+"/actions/runs", status)
 }
 
-// ListOrgRuns returns runs of one organization across its repositories. Each
-// run carries its repository, because the jobs endpoint is per repository.
-func (c *Client) ListOrgRuns(ctx context.Context, owner, status string) ([]model.Run, error) {
-	return c.listRuns(ctx, "/orgs/"+owner+"/actions/runs", status)
-}
-
 func (c *Client) listRuns(ctx context.Context, base, status string) ([]model.Run, error) {
 	var all []model.Run
 	for page := 1; page <= 5; page++ {

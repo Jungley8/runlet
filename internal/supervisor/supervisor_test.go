@@ -114,6 +114,10 @@ type ghStub struct {
 	jobs        map[string][]map[string]any
 	failRunners bool
 	failJobs    bool
+	// repos is what the org listing returns; orgCount is the organization's
+	// own repository count, which a check compares against.
+	repos    []string
+	orgCount int
 }
 
 func (g *ghStub) handler() http.Handler {
@@ -133,6 +137,18 @@ func (g *ghStub) handler() http.Handler {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(g.runners), "runners": g.runners})
+		case r.Method == http.MethodGet && r.URL.Path == "/orgs/acme":
+			total := g.orgCount
+			if total == 0 {
+				total = len(stubRepos(g.repos))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"public_repos": total, "total_private_repos": 0})
+		case r.Method == http.MethodGet && r.URL.Path == "/orgs/acme/repos":
+			out := make([]map[string]any, 0)
+			for _, name := range stubRepos(g.repos) {
+				out = append(out, map[string]any{"full_name": name})
+			}
+			_ = json.NewEncoder(w).Encode(out)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/actions/runs"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(g.runs), "workflow_runs": g.runs})
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/jobs"):
@@ -574,4 +590,48 @@ func TestWatchdogForgetsAMissWhenTheJobShowsUp(t *testing.T) {
 	if got := exec.find("stop " + st.Unit); len(got) != 0 {
 		t.Fatalf("the watchdog kept counting a miss that had cleared")
 	}
+}
+
+// TestWatchdogStopsNothingWhenTheRepoListIsIncomplete: a repository the check
+// cannot see looks exactly like a lane GitHub forgot. Acting on that would kill
+// a running job.
+func TestWatchdogStopsNothingWhenTheRepoListIsIncomplete(t *testing.T) {
+	exec := &fakeExec{}
+	stub := &ghStub{repos: []string{"acme/repo"}, orgCount: 9}
+	s, st := staleFixture(t, exec, stub)
+
+	now := time.Now()
+	s.checkStale(context.Background(), now)
+	s.checkStale(context.Background(), now.Add(20*time.Minute))
+	if got := exec.find("stop " + st.Unit); len(got) != 0 {
+		t.Fatalf("the watchdog acted on an incomplete repository list")
+	}
+}
+
+// TestWatchdogReadsEveryRepository: the job can be in any repository of the
+// organization, not only in the ones the policy allowlists.
+func TestWatchdogReadsEveryRepository(t *testing.T) {
+	exec := &fakeExec{}
+	stub := &ghStub{repos: []string{"acme/one", "acme/two"}}
+	s, st := staleFixture(t, exec, stub)
+	stub.runs = []map[string]any{{"id": 9}}
+	stub.jobs = map[string][]map[string]any{
+		"9": {{"id": 1, "runner_name": st.RunnerName, "status": "in_progress"}},
+	}
+	// The stub answers the same run for every repository path, which is enough
+	// to show that a job in a second repository is seen.
+	now := time.Now()
+	s.checkStale(context.Background(), now)
+	s.checkStale(context.Background(), now.Add(20*time.Minute))
+	if got := exec.find("stop " + st.Unit); len(got) != 0 {
+		t.Fatalf("the watchdog ignored a job in another repository")
+	}
+}
+
+// stubRepos is what the org listing returns when a test does not name any.
+func stubRepos(repos []string) []string {
+	if repos == nil {
+		return []string{"acme/repo"}
+	}
+	return repos
 }

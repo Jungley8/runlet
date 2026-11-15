@@ -58,3 +58,42 @@ func (c *Client) ListRunJobs(ctx context.Context, slug string, runID int64) ([]m
 	}
 	return resp.Jobs, nil
 }
+
+// ListOrgRepos returns the full names of the organization's repositories that
+// the token can see, up to limit. GitHub has no endpoint that lists the jobs of
+// an organization, so a caller that needs them has to walk the repositories.
+func (c *Client) ListOrgRepos(ctx context.Context, owner string, limit int) ([]string, error) {
+	var out []string
+	for page := 1; len(out) < limit; page++ {
+		var resp []struct {
+			FullName string `json:"full_name"`
+		}
+		path := fmt.Sprintf("/orgs/%s/repos?type=all&per_page=100&page=%d", owner, page)
+		if err := c.getJSON(ctx, path, &resp); err != nil {
+			return nil, err
+		}
+		for _, r := range resp {
+			out = append(out, r.FullName)
+		}
+		if len(resp) < 100 {
+			break
+		}
+	}
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// OrgRepoCount returns how many repositories the organization has. A caller
+// that listed fewer than this saw an incomplete picture.
+func (c *Client) OrgRepoCount(ctx context.Context, owner string) (int, error) {
+	var org struct {
+		PublicRepos       int `json:"public_repos"`
+		TotalPrivateRepos int `json:"total_private_repos"`
+	}
+	if err := c.getJSON(ctx, "/orgs/"+owner, &org); err != nil {
+		return 0, err
+	}
+	return org.PublicRepos + org.TotalPrivateRepos, nil
+}
