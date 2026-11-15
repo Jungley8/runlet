@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -347,10 +348,15 @@ func cmdDoctor(args []string) error {
 			avail, merr := memAvailable()
 			check("memavailable", merr)
 			if merr == nil {
-				fmt.Printf("      available: %s, lane budget: %s\n", config.Bytes(avail), cfg.Pool.MemoryBudget)
-				if avail < cfg.Pool.MemoryBudget.Int64() {
-					check("memory headroom", fmt.Errorf("available %s is below pool.memory_budget %s",
-						config.Bytes(avail), cfg.Pool.MemoryBudget))
+				// Lanes that are already running hold part of the budget. Counting
+				// it twice reports a failure on a host that is running exactly the
+				// lanes the file describes.
+				inUse := laneMemoryInUse()
+				fmt.Printf("      available: %s, held by running lanes: %s, lane budget: %s\n",
+					config.Bytes(avail), config.Bytes(inUse), cfg.Pool.MemoryBudget)
+				if avail+inUse < cfg.Pool.MemoryBudget.Int64() {
+					check("memory headroom", fmt.Errorf("available %s plus %s already in lanes is below pool.memory_budget %s",
+						config.Bytes(avail), config.Bytes(inUse), cfg.Pool.MemoryBudget))
 				}
 			}
 		}
@@ -468,4 +474,29 @@ func memAvailable() (int64, error) {
 		}
 	}
 	return 0, errors.New("MemAvailable not found in /proc/meminfo")
+}
+
+// laneMemoryInUse sums MemoryCurrent over the lane scopes that are running. A
+// missing systemd or a host without lanes answers 0, which keeps the preflight
+// conservative rather than optimistic.
+func laneMemoryInUse() int64 {
+	out, err := exec.Command("systemctl", "--user", "list-units", "--plain", "--no-legend", "runlet-lane-*.scope").Output()
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, line := range strings.Split(string(out), "\n") {
+		unit := strings.Fields(line)
+		if len(unit) == 0 {
+			continue
+		}
+		v, err := exec.Command("systemctl", "--user", "show", unit[0], "-p", "MemoryCurrent", "--value").Output()
+		if err != nil {
+			continue
+		}
+		if n, err := strconv.ParseInt(strings.TrimSpace(string(v)), 10, 64); err == nil && n > 0 {
+			total += n
+		}
+	}
+	return total
 }
