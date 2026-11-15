@@ -33,6 +33,9 @@ type Run struct {
 	// branch can feed several PRs with different base branches; without the
 	// base they collide in the group key and one is wrongly cancelled.
 	PullRequests []PullRequest `json:"pull_requests,omitempty" yaml:"pull_requests,omitempty"`
+	// Repository is the repository the run belongs to. An org-level listing
+	// returns runs from many repositories, and the jobs endpoint needs one.
+	Repository *Repository `json:"repository,omitempty" yaml:"repository,omitempty"`
 }
 
 // PullRequest is the slice of a workflow run's pull_requests entry that runlet
@@ -75,6 +78,15 @@ func (r Run) HeadRepo() string {
 		return ""
 	}
 	return r.HeadRepository.FullName
+}
+
+// RepoFullName returns the repository the run belongs to, or "" when the API
+// did not include one.
+func (r Run) RepoFullName() string {
+	if r.Repository == nil {
+		return ""
+	}
+	return r.Repository.FullName
 }
 
 // Runner is a self-hosted runner registration.

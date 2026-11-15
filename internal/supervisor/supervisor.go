@@ -21,6 +21,7 @@ import (
 	"github.com/Jungley8/runlet/internal/lane"
 	"github.com/Jungley8/runlet/internal/metrics"
 	"github.com/Jungley8/runlet/internal/model"
+	"github.com/Jungley8/runlet/internal/policy"
 )
 
 const maxBackoff = 5 * time.Minute
@@ -41,6 +42,11 @@ type Supervisor struct {
 	drain  string
 	mu     sync.Mutex
 	limits map[int]string // lane index -> adopted unit
+	// miss remembers, per lane, when the watchdog first saw GitHub report the
+	// runner busy with no job behind it.
+	miss       map[int]time.Time
+	staleAfter time.Duration
+	watchEvery time.Duration
 }
 
 func New(opts Options) (*Supervisor, error) {
@@ -70,6 +76,15 @@ func New(opts Options) (*Supervisor, error) {
 		host:   host,
 		drain:  filepath.Join(pool.StateDir, "DRAIN"),
 		limits: make(map[int]string),
+		miss:   make(map[int]time.Time),
+	}
+	s.staleAfter = pool.StaleAfter()
+	s.watchEvery = 2 * time.Minute
+	if s.staleAfter > 0 && s.staleAfter/2 < s.watchEvery {
+		s.watchEvery = s.staleAfter / 2
+	}
+	if s.watchEvery < 15*time.Second {
+		s.watchEvery = 15 * time.Second
 	}
 	for i, lc := range pool.Lanes {
 		s.lanes = append(s.lanes, lane.New(lane.Options{
@@ -114,9 +129,29 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			s.loop(ctx, l)
 		}(l)
 	}
+	if s.staleAfter > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.watch(ctx)
+		}()
+	}
 	<-ctx.Done()
 	wg.Wait()
 	return nil
+}
+
+func (s *Supervisor) watch(ctx context.Context) {
+	t := time.NewTicker(s.watchEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.checkStale(ctx, time.Now())
+		}
+	}
 }
 
 // adopt finds lane scopes that are still running. A supervisor restart must not
@@ -395,4 +430,138 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	case <-t.C:
 		return true
 	}
+}
+
+// maxStaleRuns bounds how many in-progress runs the watchdog inspects per
+// check. Each run costs one request, and a healthy pool has one or two.
+const maxStaleRuns = 50
+
+// checkStale stops a lane that GitHub reports busy while no in-progress job
+// claims its runner. A cancelled job can leave a detached process tree behind;
+// the runner then waits for that tree forever, so the lane never takes new
+// work and the tree keeps its memory. Stopping the scope kills the whole
+// cgroup, which is the only thing that reaches a detached grandchild.
+func (s *Supervisor) checkStale(ctx context.Context, now time.Time) {
+	if s.staleAfter <= 0 {
+		return
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	runners, err := s.opts.Client.ListRunners(checkCtx, s.scope.APIPath())
+	if err != nil {
+		// An incomplete answer must not stop a lane: a wrong stop fails a
+		// running job.
+		s.opts.Log.Warn("stale check skipped: list runners failed", "err", err)
+		return
+	}
+	busy := make(map[string]bool, len(runners))
+	for _, r := range runners {
+		if r.Busy {
+			busy[r.Name] = true
+		}
+	}
+	active, err := s.activeRunnerNames(checkCtx)
+	if err != nil {
+		s.opts.Log.Warn("stale check skipped: cannot read in-progress jobs", "err", err)
+		return
+	}
+
+	for idx, unit := range s.units() {
+		if idx < 0 || idx >= len(s.lanes) {
+			continue
+		}
+		st, err := s.lanes[idx].LoadState()
+		if err != nil || st.Unit != unit || !busy[st.RunnerName] || active[st.RunnerName] {
+			s.clearMiss(idx)
+			continue
+		}
+		first, seen := s.missedAt(idx)
+		if !seen {
+			s.markMiss(idx, now)
+			continue
+		}
+		if now.Sub(first) < s.staleAfter {
+			continue
+		}
+		s.opts.Log.Warn("stopping a lane GitHub has no job for",
+			"lane", s.lanes[idx].Name(), "runner", st.RunnerName, "unit", unit,
+			"busy_for", now.Sub(first).Round(time.Second).String())
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = s.lanes[idx].Stop(stopCtx, unit)
+		stopCancel()
+		s.opts.Metrics.Add("runlet_lane_stale_stops_total", map[string]string{"lane": s.lanes[idx].Name()}, 1)
+		s.clearMiss(idx)
+	}
+}
+
+// activeRunnerNames asks GitHub which runners are executing a job right now.
+func (s *Supervisor) activeRunnerNames(ctx context.Context) (map[string]bool, error) {
+	var (
+		runs []model.Run
+		err  error
+	)
+	if s.scope.Repo == "" {
+		runs, err = s.opts.Client.ListOrgRuns(ctx, s.scope.Owner, policy.StatusInProgress)
+	} else {
+		runs, err = s.opts.Client.ListRuns(ctx, s.scope.Owner+"/"+s.scope.Repo, policy.StatusInProgress)
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(runs))
+	for i, r := range runs {
+		if i >= maxStaleRuns {
+			break
+		}
+		slug := r.RepoFullName()
+		if slug == "" {
+			if s.scope.Repo == "" {
+				// An org listing always names its repository. Without one the
+				// job list cannot be queried, and guessing would hide a stale
+				// lane rather than report it.
+				continue
+			}
+			slug = s.scope.Owner + "/" + s.scope.Repo
+		}
+		jobs, err := s.opts.Client.ListRunJobs(ctx, slug, r.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, j := range jobs {
+			if j.RunnerName != "" && j.Status == policy.StatusInProgress {
+				out[j.RunnerName] = true
+			}
+		}
+	}
+	return out, nil
+}
+
+func (s *Supervisor) units() map[int]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[int]string, len(s.limits))
+	for idx, unit := range s.limits {
+		out[idx] = unit
+	}
+	return out
+}
+
+func (s *Supervisor) missedAt(idx int) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at, ok := s.miss[idx]
+	return at, ok
+}
+
+func (s *Supervisor) markMiss(idx int, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.miss[idx] = now
+}
+
+func (s *Supervisor) clearMiss(idx int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.miss, idx)
 }

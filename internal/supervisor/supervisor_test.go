@@ -108,6 +108,12 @@ type ghStub struct {
 	tokens  int
 	deleted []int64
 	runners []map[string]any
+	// runs and jobs answer the watchdog: an in-progress run carries its
+	// repository, and jobs are keyed by run id.
+	runs        []map[string]any
+	jobs        map[string][]map[string]any
+	failRunners bool
+	failJobs    bool
 }
 
 func (g *ghStub) handler() http.Handler {
@@ -122,7 +128,22 @@ func (g *ghStub) handler() http.Handler {
 				"expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
 			})
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/runners"):
+			if g.failRunners {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(g.runners), "runners": g.runners})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/actions/runs"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(g.runs), "workflow_runs": g.runs})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/jobs"):
+			if g.failJobs {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+			runID := parts[len(parts)-2]
+			jobs := g.jobs[runID]
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(jobs), "jobs": jobs})
 		case r.Method == http.MethodDelete:
 			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 			id, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
@@ -419,5 +440,138 @@ func TestAttemptClearsStateWhenTheScopeEnds(t *testing.T) {
 	}
 	if _, err := s.lanes[0].LoadState(); !os.IsNotExist(err) {
 		t.Fatalf("state survived a finished attempt: %v", err)
+	}
+}
+
+// staleFixture puts one live lane in the supervisor: a saved attempt, an
+// adopted unit, and a busy registration on the stub.
+func staleFixture(t *testing.T, exec *fakeExec, stub *ghStub) (*Supervisor, lane.State) {
+	t.Helper()
+	s := testSupervisor(t, exec, stub)
+	st := s.lanes[0].Attempt()
+	if err := s.lanes[0].SaveState(st); err != nil {
+		t.Fatal(err)
+	}
+	s.limits[0] = st.Unit
+	stub.runners = []map[string]any{{"id": 1, "name": st.RunnerName, "status": "online", "busy": true}}
+	return s, st
+}
+
+// TestWatchdogStopsALaneGitHubHasNoJobFor: a cancelled job can leave a detached
+// process tree behind. The runner reports busy forever, no in-progress job
+// claims it, and the lane never takes new work.
+func TestWatchdogStopsALaneGitHubHasNoJobFor(t *testing.T) {
+	exec := &fakeExec{}
+	s, st := staleFixture(t, exec, &ghStub{})
+	now := time.Now()
+
+	s.checkStale(context.Background(), now)
+	if got := exec.find("stop " + st.Unit); len(got) != 0 {
+		t.Fatalf("the watchdog stopped a lane on the first miss")
+	}
+	s.checkStale(context.Background(), now.Add(time.Minute))
+	if got := exec.find("stop " + st.Unit); len(got) != 0 {
+		t.Fatalf("the watchdog stopped a lane inside the window")
+	}
+
+	s.checkStale(context.Background(), now.Add(11*time.Minute))
+	got := exec.find("stop " + st.Unit)
+	if len(got) != 1 {
+		t.Fatalf("stale lane stop calls = %d, want 1", len(got))
+	}
+}
+
+// TestWatchdogLeavesALaneWithAnInProgressJob: the runner is busy because a job
+// is running, which is exactly the normal case.
+func TestWatchdogLeavesALaneWithAnInProgressJob(t *testing.T) {
+	exec := &fakeExec{}
+	stub := &ghStub{}
+	s, st := staleFixture(t, exec, stub)
+	stub.runs = []map[string]any{
+		{"id": 5, "repository": map[string]any{"full_name": "acme/repo"}},
+	}
+	stub.jobs = map[string][]map[string]any{
+		"5": {{"id": 1, "runner_name": st.RunnerName, "status": "in_progress"}},
+	}
+
+	now := time.Now()
+	s.checkStale(context.Background(), now)
+	s.checkStale(context.Background(), now.Add(20*time.Minute))
+	if got := exec.find("stop " + st.Unit); len(got) != 0 {
+		t.Fatalf("the watchdog stopped a lane that is running a job")
+	}
+}
+
+// TestWatchdogIgnoresAnIdleLane: an idle runner is not busy, and stopping it
+// would only cost a registration.
+func TestWatchdogIgnoresAnIdleLane(t *testing.T) {
+	exec := &fakeExec{}
+	stub := &ghStub{}
+	s, st := staleFixture(t, exec, stub)
+	stub.runners[0]["busy"] = false
+
+	now := time.Now()
+	s.checkStale(context.Background(), now)
+	s.checkStale(context.Background(), now.Add(20*time.Minute))
+	if got := exec.find("stop " + st.Unit); len(got) != 0 {
+		t.Fatalf("the watchdog stopped an idle lane")
+	}
+}
+
+// TestWatchdogDoesNotStopOnAnAPIError: without a complete answer the watchdog
+// must do nothing. A wrong stop fails a running job.
+func TestWatchdogDoesNotStopOnAnAPIError(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stub  *ghStub
+		setup func(*ghStub)
+	}{
+		{name: "runners unavailable", stub: &ghStub{failRunners: true}},
+		{name: "jobs unavailable", stub: &ghStub{failJobs: true}, setup: func(g *ghStub) {
+			g.runs = []map[string]any{{"id": 5, "repository": map[string]any{"full_name": "acme/repo"}}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := &fakeExec{}
+			s, st := staleFixture(t, exec, tc.stub)
+			if tc.setup != nil {
+				tc.setup(tc.stub)
+			}
+
+			now := time.Now()
+			s.checkStale(context.Background(), now)
+			s.checkStale(context.Background(), now.Add(20*time.Minute))
+			if got := exec.find("stop " + st.Unit); len(got) != 0 {
+				t.Fatalf("the watchdog acted on a failed API call")
+			}
+		})
+	}
+}
+
+// TestWatchdogForgetsAMissWhenTheJobShowsUp: the API can lag a start. A lane
+// that is seen with a job again starts its count from zero.
+func TestWatchdogForgetsAMissWhenTheJobShowsUp(t *testing.T) {
+	exec := &fakeExec{}
+	stub := &ghStub{}
+	s, st := staleFixture(t, exec, stub)
+	now := time.Now()
+
+	s.checkStale(context.Background(), now)
+
+	stub.mu.Lock()
+	stub.runs = []map[string]any{{"id": 5, "repository": map[string]any{"full_name": "acme/repo"}}}
+	stub.jobs = map[string][]map[string]any{"5": {{"id": 1, "runner_name": st.RunnerName, "status": "in_progress"}}}
+	stub.mu.Unlock()
+
+	s.checkStale(context.Background(), now.Add(9*time.Minute))
+
+	stub.mu.Lock()
+	stub.runs = nil
+	stub.mu.Unlock()
+	// Nine minutes of the threshold were spent with a job; the miss starts
+	// again here, so this check must not stop the lane.
+	s.checkStale(context.Background(), now.Add(10*time.Minute))
+	if got := exec.find("stop " + st.Unit); len(got) != 0 {
+		t.Fatalf("the watchdog kept counting a miss that had cleared")
 	}
 }

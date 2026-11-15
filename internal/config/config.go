@@ -80,6 +80,19 @@ type PoolConfig struct {
 	RunnerURL    string       `yaml:"runner_url"`
 	MemoryBudget Bytes        `yaml:"memory_budget"`
 	Lanes        []LaneConfig `yaml:"lanes"`
+	// StaleLaneMinutes is how long a lane may report busy while GitHub has no
+	// in-progress job for its runner before the supervisor stops the scope and
+	// kills the process tree. Absent takes 10. An explicit 0 turns it off.
+	StaleLaneMinutes *int `yaml:"stale_lane_minutes,omitempty"`
+}
+
+// StaleAfter is how long a lane may stay busy while GitHub has no in-progress
+// job for its runner. Zero turns the watchdog off.
+func (p PoolConfig) StaleAfter() time.Duration {
+	if p.StaleLaneMinutes == nil {
+		return 10 * time.Minute
+	}
+	return time.Duration(*p.StaleLaneMinutes) * time.Minute
 }
 
 type LaneConfig struct {
@@ -241,6 +254,9 @@ func (c *Config) Validate() error {
 			errs = append(errs, errors.New("pool.memory_budget is required when lanes are configured"))
 		} else if total > c.Pool.MemoryBudget {
 			errs = append(errs, fmt.Errorf("lane memory %s exceeds pool.memory_budget %s", total, c.Pool.MemoryBudget))
+		}
+		if c.Pool.StaleLaneMinutes != nil && *c.Pool.StaleLaneMinutes < 0 {
+			errs = append(errs, fmt.Errorf("pool.stale_lane_minutes must not be negative, got %d", *c.Pool.StaleLaneMinutes))
 		}
 	}
 

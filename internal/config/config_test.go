@@ -265,3 +265,29 @@ func TestValidateRejectsALaneNameThatIsAPath(t *testing.T) {
 		}
 	}
 }
+
+func TestStaleAfter(t *testing.T) {
+	ten, zero := 10, 0
+	cases := map[string]struct {
+		minutes *int
+		want    time.Duration
+	}{
+		"absent": {nil, 10 * time.Minute},
+		"set":    {&ten, 10 * time.Minute},
+		"off":    {&zero, 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := (PoolConfig{StaleLaneMinutes: tc.minutes}).StaleAfter(); got != tc.want {
+				t.Fatalf("StaleAfter = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsANegativeStaleWindow(t *testing.T) {
+	body := strings.Replace(validYAML, "  memory_budget: 3.5GiB", "  memory_budget: 3.5GiB\n  stale_lane_minutes: -1", 1)
+	if _, err := Load(writeTemp(t, body)); err == nil || !strings.Contains(err.Error(), "stale_lane_minutes") {
+		t.Fatalf("want a stale_lane_minutes error, got %v", err)
+	}
+}
