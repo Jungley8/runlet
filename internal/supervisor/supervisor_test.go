@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -680,4 +681,51 @@ func stubRepos(repos []string) []string {
 		return []string{"acme/repo"}
 	}
 	return repos
+}
+
+// TestNewWarnsWhenMemoryHighIsBelowMemory: on the mean host a lane that reclaims
+// its own page cache re-reads every build input from disk. The warning is the
+// only signal an operator gets before the host's disk saturates.
+func TestNewWarnsWhenMemoryHighIsBelowMemory(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		high    config.Bytes
+		wantLog bool
+	}{
+		{name: "high below max", high: config.Bytes(1600 << 20), wantLog: true},
+		{name: "high equals max", high: config.Bytes(2 << 30), wantLog: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			srv := httptest.NewServer((&ghStub{}).handler())
+			t.Cleanup(srv.Close)
+			dir := t.TempDir()
+			cfg := &config.Config{Pool: config.PoolConfig{
+				StateDir:     filepath.Join(dir, "state"),
+				WorkDir:      filepath.Join(dir, "work"),
+				RunnerDir:    fakeRunnerDir(t),
+				RunnerURL:    "https://github.com/acme",
+				MemoryBudget: config.Bytes(4 << 30),
+				Lanes: []config.LaneConfig{{
+					Name:       "lane-0",
+					Labels:     []string{"self-hosted"},
+					Memory:     config.Bytes(2 << 30),
+					MemoryHigh: tc.high,
+					CPUQuota:   "200%",
+				}},
+			}}
+			if _, err := New(Options{
+				Config: cfg,
+				Client: ghapi.New("tok", ghapi.WithBaseURL(srv.URL)),
+				Exec:   &fakeExec{},
+				Log:    slog.New(slog.NewTextHandler(&buf, nil)),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			got := strings.Contains(buf.String(), "memory_high is below memory")
+			if got != tc.wantLog {
+				t.Fatalf("warning logged = %v, want %v; log: %s", got, tc.wantLog, buf.String())
+			}
+		})
+	}
 }

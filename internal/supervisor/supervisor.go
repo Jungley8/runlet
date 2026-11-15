@@ -87,6 +87,13 @@ func New(opts Options) (*Supervisor, error) {
 		s.watchEvery = 15 * time.Second
 	}
 	for i, lc := range pool.Lanes {
+		if lc.MemoryHigh > 0 && lc.MemoryHigh < lc.Memory {
+			// Measured on the macmini: at memory_high below memory the lane
+			// reclaims its own page cache, and a Go compile then re-reads the
+			// same sources from disk until the SSD is the bottleneck.
+			opts.Log.Warn("memory_high is below memory: the lane will reclaim its page cache and re-read build inputs from disk",
+				"lane", lc.Name, "memory_high", lc.MemoryHigh.Int64(), "memory", lc.Memory.Int64())
+		}
 		s.lanes = append(s.lanes, lane.New(lane.Options{
 			Index:      i,
 			Name:       lc.Name,

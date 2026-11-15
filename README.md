@@ -108,12 +108,18 @@ Set `pool.lanes` to run runner processes. Each lane is its own runner
 registration, its own directory, and its own systemd scope:
 
 - Size a lane from what the job needs, not from what the build alone needs.
-  The runner process itself takes about 0.5 GiB of the lane, so a 2 GiB lane
-  leaves roughly 1.5 GiB for the job. A lane that sits at `memory_high` all the
-  time is thrashing: its page cache is reclaimed on every read, and the job
-  spends its time waiting on disk. `systemctl --user show <unit>.scope
-  -p MemoryCurrent` and the `memory.pressure` file in the scope's cgroup show
-  whether that is happening.
+  The runner process itself takes about 0.5 GiB of the lane, so a 2.5 GiB lane
+  leaves roughly 2 GiB for the job.
+- Keep `memory_high` equal to `memory`. A lower `memory_high` makes the lane
+  reclaim memory early, and the reclaimed pages are the lane's own page cache.
+  A compiler then re-reads the same sources from disk: measured on one host at
+  `memory_high: 1.6GiB` with a 2 GiB cap, two compile processes read 264 GB
+  each from disk at 470 MB/s and the disk, not the CPU, set the pace. When the
+  cap is the only threshold, the cache stays and the reads stop. The process
+  logs a warning at startup for a `memory_high` below `memory`.
+- The `memory.pressure` file in the lane's cgroup shows whether a lane is
+  waiting on memory. `systemctl --user show <unit>.scope -p MemoryCurrent`
+  shows what it holds.
 - The runner install in `pool.runner_dir` is hardlinked into each lane. One
   inode per file, so a second lane costs almost no disk.
 - `pool.runner_dir` must be a complete extracted runner release, or a live

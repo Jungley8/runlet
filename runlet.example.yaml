@@ -28,9 +28,13 @@ pool:
   lanes:
     - name: "lane-0"
       labels: ["self-hosted", "linux", "x64"]
-      memory: "1.5GiB"
-      memory_high: "1.2GiB"
-      cpu_quota: "250%"
+      # memory is the hard cap. memory_high is an earlier soft cap: the lane
+      # reclaims memory at that point, and the reclaimed pages include the
+      # lane's own page cache. A compiler then re-reads its sources from disk.
+      # Set memory_high equal to memory unless you want that throttling.
+      memory: "2.5GiB"
+      memory_high: "2.5GiB"
+      cpu_quota: "300%"
 
 repos:
   # Only these repositories are touched. A repository that is not listed here is
