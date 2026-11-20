@@ -350,3 +350,93 @@ func TestScratchEveryZeroTurnsTheSweepOff(t *testing.T) {
 		t.Fatalf("every = %s, want 0", cfg.Scratch.EveryFor())
 	}
 }
+
+func TestPoolEnvValid(t *testing.T) {
+	envBlock := `  env:
+    HTTPS_PROXY: "http://proxy.example:8080"
+    HTTP_PROXY: "http://proxy.example:8080"
+    NO_PROXY: "localhost,127.0.0.1"
+    CUSTOM_KEY_1: "custom_value"
+    _UNDER: "val"
+`
+	yamlText := strings.Replace(validYAML, "pool:\n", "pool:\n"+envBlock, 1)
+	cfg, err := Load(writeTemp(t, yamlText))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := cfg.Pool.Env["HTTPS_PROXY"], "http://proxy.example:8080"; got != want {
+		t.Fatalf("HTTPS_PROXY = %q, want %q", got, want)
+	}
+	if got, want := cfg.Pool.Env["_UNDER"], "val"; got != want {
+		t.Fatalf("_UNDER = %q, want %q", got, want)
+	}
+}
+
+func TestPoolEnvRejectsInvalidKeyChars(t *testing.T) {
+	badKeys := []string{
+		"1STARTS_WITH_DIGIT",
+		"HAS-DASH",
+		"HAS.DOT",
+		"HAS SPACE",
+		"HAS=EQUALS",
+		"",
+	}
+	for _, k := range badKeys {
+		t.Run(k, func(t *testing.T) {
+			cfg := Config{
+				Pool: PoolConfig{
+					Env: map[string]string{k: "val"},
+				},
+			}
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "pool.env key") {
+				t.Fatalf("key %q: want invalid key error, got %v", k, err)
+			}
+		})
+	}
+}
+
+func TestPoolEnvRejectsNUL(t *testing.T) {
+	cfg := Config{
+		Pool: PoolConfig{
+			Env: map[string]string{"VALID_KEY": "val\x00with_nul"},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "NUL") {
+		t.Fatalf("want NUL error, got %v", err)
+	}
+}
+
+func TestPoolEnvRejectsReservedKeys(t *testing.T) {
+	reserved := []string{
+		"HOME",
+		"PATH",
+		"LANG",
+		"TMPDIR",
+		"GOCACHE",
+		"GOMODCACHE",
+		"PNPM_STORE_DIR",
+		"XDG_RUNTIME_DIR",
+		"DBUS_SESSION_BUS_ADDRESS",
+	}
+	for _, key := range reserved {
+		t.Run(key, func(t *testing.T) {
+			cfg := Config{
+				Pool: PoolConfig{
+					Env: map[string]string{key: "forbidden"},
+				},
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("key %q: want error for reserved key, got nil", key)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Fatalf("key %q: error %q does not contain key name", key, err.Error())
+			}
+			if !strings.Contains(err.Error(), "reserved") {
+				t.Fatalf("key %q: error %q does not mention reserved", key, err.Error())
+			}
+		})
+	}
+}

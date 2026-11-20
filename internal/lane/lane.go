@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -111,6 +112,7 @@ type Options struct {
 	Host       string // short hostname, part of the runner name
 	Exec       Execer
 	Log        *slog.Logger
+	Env        map[string]string
 }
 
 // Lane is one runner slot. Its methods are safe for concurrent use.
@@ -501,6 +503,11 @@ func (l *Lane) Scope(unit string) Command {
 		// tmpfs fails every lane at once. The lane directory is on disk and is
 		// emptied at the start of each attempt.
 		"--setenv=TMPDIR="+l.tmpDir(),
+	)
+	for _, k := range l.sortedEnvKeys() {
+		args = append(args, "--setenv="+k+"="+l.opts.Env[k])
+	}
+	args = append(args,
 		"--working-directory="+l.opts.Dir,
 		filepath.Join(l.opts.Dir, "run.sh"),
 	)
@@ -625,6 +632,18 @@ func rotateDiag(dir string, maxAge time.Duration) {
 // Deregister is done by the supervisor through the API: it needs the list and
 // delete endpoints of the registration scope, which this package does not own.
 
+func (l *Lane) sortedEnvKeys() []string {
+	if len(l.opts.Env) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(l.opts.Env))
+	for k := range l.opts.Env {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
 func (l *Lane) env() []string {
 	env := []string{
 		"HOME=" + l.homeDir(),
@@ -641,6 +660,9 @@ func (l *Lane) env() []string {
 		if v, ok := os.LookupEnv(k); ok {
 			env = append(env, k+"="+v)
 		}
+	}
+	for _, k := range l.sortedEnvKeys() {
+		env = append(env, k+"="+l.opts.Env[k])
 	}
 	return env
 }
