@@ -143,6 +143,7 @@ registration, its own directory, and its own systemd scope:
   are not safe to share between runner processes.
 - `GOCACHE`, `GOMODCACHE`, and `PNPM_STORE_DIR` point at one shared cache, so
   two lanes do not re-download the same modules.
+- Set `pool.env` to inject environment variables into each lane; keys reserved by runlet are rejected.
 - `systemd-run --user --scope` sets `MemoryMax`, `MemoryHigh`, and `CPUQuota`.
   `KillMode=control-group` stops a job's child processes with the lane.
 - Runner names are unique per attempt, so two overlapping attempts cannot

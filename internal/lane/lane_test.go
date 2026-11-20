@@ -586,3 +586,101 @@ func TestCleanupEmptiesTheLaneTempDirectory(t *testing.T) {
 		t.Fatalf("temp directory still holds %d entries after Cleanup", len(entries))
 	}
 }
+
+func TestScopeAndEnvWithPoolEnv(t *testing.T) {
+	opts := testOptions(t, &fakeExec{})
+	opts.Env = map[string]string{
+		"HTTPS_PROXY": "http://127.0.0.1:7890",
+		"HTTP_PROXY":  "http://127.0.0.1:7890",
+		"NO_PROXY":    "localhost,127.0.0.1",
+		"B_KEY":       "b_val",
+		"A_KEY":       "a_val",
+	}
+	l := New(opts)
+
+	cmd := l.Scope("unit-test-env")
+
+	joinedArgs := strings.Join(cmd.Args, " ")
+	if !strings.Contains(joinedArgs, "--setenv=HTTPS_PROXY=http://127.0.0.1:7890") {
+		t.Fatalf("Scope args missing HTTPS_PROXY: %v", cmd.Args)
+	}
+	wantHome := "--setenv=HOME=" + l.homeDir()
+	wantTmp := "--setenv=TMPDIR=" + l.tmpDir()
+	if !strings.Contains(joinedArgs, wantHome) {
+		t.Fatalf("Scope args missing HOME: %v", cmd.Args)
+	}
+	if !strings.Contains(joinedArgs, wantTmp) {
+		t.Fatalf("Scope args missing TMPDIR: %v", cmd.Args)
+	}
+
+	tmpIdx := -1
+	workDirIdx := -1
+	aKeyIdx := -1
+	bKeyIdx := -1
+	httpsProxyIdx := -1
+	for i, arg := range cmd.Args {
+		if strings.HasPrefix(arg, "--setenv=TMPDIR=") {
+			tmpIdx = i
+		}
+		if strings.HasPrefix(arg, "--working-directory=") {
+			workDirIdx = i
+		}
+		if arg == "--setenv=A_KEY=a_val" {
+			aKeyIdx = i
+		}
+		if arg == "--setenv=B_KEY=b_val" {
+			bKeyIdx = i
+		}
+		if arg == "--setenv=HTTPS_PROXY=http://127.0.0.1:7890" {
+			httpsProxyIdx = i
+		}
+	}
+	if tmpIdx == -1 || workDirIdx == -1 || aKeyIdx == -1 || bKeyIdx == -1 || httpsProxyIdx == -1 {
+		t.Fatalf("missing expected args in Scope: %v", cmd.Args)
+	}
+	if !(tmpIdx < aKeyIdx && aKeyIdx < bKeyIdx && bKeyIdx < httpsProxyIdx && httpsProxyIdx < workDirIdx) {
+		t.Fatalf("Scope args order mismatch: tmp=%d a=%d b=%d https=%d workdir=%d",
+			tmpIdx, aKeyIdx, bKeyIdx, httpsProxyIdx, workDirIdx)
+	}
+
+	env := l.env()
+	envMap := make(map[string]string)
+	for _, entry := range env {
+		k, v, ok := strings.Cut(entry, "=")
+		if ok {
+			envMap[k] = v
+		}
+	}
+	if got := envMap["HTTPS_PROXY"]; got != "http://127.0.0.1:7890" {
+		t.Fatalf("env() HTTPS_PROXY = %q, want %q", got, "http://127.0.0.1:7890")
+	}
+	if got := envMap["A_KEY"]; got != "a_val" {
+		t.Fatalf("env() A_KEY = %q, want %q", got, "a_val")
+	}
+	if got := envMap["HOME"]; got != l.homeDir() {
+		t.Fatalf("env() HOME overwritten: %q, want %q", got, l.homeDir())
+	}
+	if got := envMap["LANG"]; got != "C.UTF-8" {
+		t.Fatalf("env() LANG overwritten: %q, want C.UTF-8", got)
+	}
+}
+
+func TestScopeAndEnvWithoutPoolEnv(t *testing.T) {
+	opts := testOptions(t, &fakeExec{})
+	opts.Env = nil
+	l := New(opts)
+
+	cmd := l.Scope("unit-test-no-env")
+	for _, arg := range cmd.Args {
+		if strings.HasPrefix(arg, "--setenv=CUSTOM_ENV_VAR=") {
+			t.Fatalf("unexpected custom env in Scope args: %v", cmd.Args)
+		}
+	}
+
+	env := l.env()
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "CUSTOM_ENV_VAR=") {
+			t.Fatalf("unexpected custom env in env(): %v", env)
+		}
+	}
+}

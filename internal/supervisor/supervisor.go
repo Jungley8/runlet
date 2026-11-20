@@ -114,6 +114,7 @@ func New(opts Options) (*Supervisor, error) {
 			Host:       host,
 			Exec:       opts.Exec,
 			Log:        opts.Log,
+			Env:        pool.Env,
 		}))
 	}
 	if len(s.lanes) == 0 {

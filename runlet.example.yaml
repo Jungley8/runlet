@@ -36,6 +36,12 @@ pool:
       memory_high: "2.5GiB"
       cpu_quota: "300%"
 
+  # Injected into every lane for outbound proxies; set NO_PROXY explicitly.
+  env:
+    HTTPS_PROXY: "http://proxy.example:8080"
+    HTTP_PROXY: "http://proxy.example:8080"
+    NO_PROXY: "localhost,127.0.0.1"
+
   # The temp filesystem builds write to. A tmpfs here spends memory on every
   # leftover build directory, and a full one fails every lane at once.
   # The sweep removes directories that match patterns, are older than stale,

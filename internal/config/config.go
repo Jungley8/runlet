@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -85,7 +86,8 @@ type PoolConfig struct {
 	// kills the process tree. Absent takes 15. An explicit 0 turns it off.
 	StaleLaneMinutes *int `yaml:"stale_lane_minutes,omitempty"`
 	// Scratch is the shared temp directory that build tools write to.
-	Scratch ScratchConfig `yaml:"scratch,omitempty"`
+	Scratch ScratchConfig     `yaml:"scratch,omitempty"`
+	Env     map[string]string `yaml:"env,omitempty"`
 }
 
 // ScratchConfig watches and trims the temp directory builds write to. A host
@@ -210,6 +212,20 @@ var slugPartRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 // laneNameRE keeps a lane name a plain directory name. It must start with an
 // alphanumeric, which rejects ".", "..", and "./lane-0".
 var laneNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+var reservedEnvKeys = map[string]bool{
+	"HOME":                     true,
+	"PATH":                     true,
+	"LANG":                     true,
+	"TMPDIR":                   true,
+	"GOCACHE":                  true,
+	"GOMODCACHE":               true,
+	"PNPM_STORE_DIR":           true,
+	"XDG_RUNTIME_DIR":          true,
+	"DBUS_SESSION_BUS_ADDRESS": true,
+}
 
 // loopbackHosts is an allowlist, not a check for a private range. A LAN address
 // is still reachable by every device on the network.
@@ -355,6 +371,22 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("pool.stale_lane_minutes must not be negative, got %d", *c.Pool.StaleLaneMinutes))
 		}
 		errs = append(errs, c.Pool.Scratch.validate(c.Pool.WorkDir, c.Pool.StateDir)...)
+	}
+
+	keys := make([]string, 0, len(c.Pool.Env))
+	for k := range c.Pool.Env {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, k := range keys {
+		if reservedEnvKeys[k] {
+			errs = append(errs, fmt.Errorf("pool.env %q is reserved: runlet manages it", k))
+		} else if !envKeyRE.MatchString(k) {
+			errs = append(errs, fmt.Errorf("pool.env key %q must match %s", k, envKeyRE))
+		}
+		if strings.ContainsRune(c.Pool.Env[k], '\x00') {
+			errs = append(errs, fmt.Errorf("pool.env[%q] value must not contain NUL", k))
+		}
 	}
 
 	return errors.Join(errs...)
