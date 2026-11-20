@@ -82,7 +82,7 @@ type PoolConfig struct {
 	Lanes        []LaneConfig `yaml:"lanes"`
 	// StaleLaneMinutes is how long a lane may report busy while GitHub has no
 	// in-progress job for its runner before the supervisor stops the scope and
-	// kills the process tree. Absent takes 10. An explicit 0 turns it off.
+	// kills the process tree. Absent takes 15. An explicit 0 turns it off.
 	StaleLaneMinutes *int `yaml:"stale_lane_minutes,omitempty"`
 	// Scratch is the shared temp directory that build tools write to.
 	Scratch ScratchConfig `yaml:"scratch,omitempty"`
@@ -186,7 +186,7 @@ func (s ScratchConfig) validate(workDir, stateDir string) []error {
 // job for its runner. Zero turns the watchdog off.
 func (p PoolConfig) StaleAfter() time.Duration {
 	if p.StaleLaneMinutes == nil {
-		return 10 * time.Minute
+		return 15 * time.Minute
 	}
 	return time.Duration(*p.StaleLaneMinutes) * time.Minute
 }

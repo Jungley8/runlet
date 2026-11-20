@@ -23,8 +23,8 @@ pool:
   # A cancelled job can leave a detached process tree behind. The runner then
   # reports busy forever and the lane never takes new work. When the runner is
   # busy but GitHub has no in-progress job for it for this long, runlet stops
-  # the scope and kills the tree. Absent takes 10; 0 turns it off.
-  stale_lane_minutes: 10
+  # the scope and kills the tree. Absent takes 15; 0 turns it off.
+  stale_lane_minutes: 15
   lanes:
     - name: "lane-0"
       labels: ["self-hosted", "linux", "x64"]

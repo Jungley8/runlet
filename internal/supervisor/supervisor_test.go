@@ -491,7 +491,12 @@ func TestWatchdogStopsALaneGitHubHasNoJobFor(t *testing.T) {
 		t.Fatalf("the watchdog stopped a lane inside the window")
 	}
 
-	s.checkStale(context.Background(), now.Add(11*time.Minute))
+	s.checkStale(context.Background(), now.Add(14*time.Minute))
+	if got := exec.find("stop " + st.Unit); len(got) != 0 {
+		t.Fatalf("the watchdog stopped a lane inside the 15 minute window")
+	}
+
+	s.checkStale(context.Background(), now.Add(16*time.Minute))
 	got := exec.find("stop " + st.Unit)
 	if len(got) != 1 {
 		t.Fatalf("stale lane stop calls = %d, want 1", len(got))
@@ -626,7 +631,7 @@ func TestWatchdogStopsALaneWhoseRegistrationIsGone(t *testing.T) {
 	if got := exec.find("stop " + st.Unit); len(got) != 0 {
 		t.Fatalf("the watchdog stopped a lane on the first miss")
 	}
-	s.checkStale(context.Background(), now.Add(11*time.Minute))
+	s.checkStale(context.Background(), now.Add(16*time.Minute))
 	if got := exec.find("stop " + st.Unit); len(got) != 1 {
 		t.Fatalf("stale lane stop calls = %d, want 1", len(got))
 	}

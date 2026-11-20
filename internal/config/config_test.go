@@ -267,13 +267,13 @@ func TestValidateRejectsALaneNameThatIsAPath(t *testing.T) {
 }
 
 func TestStaleAfter(t *testing.T) {
-	ten, zero := 10, 0
+	fifteen, zero := 15, 0
 	cases := map[string]struct {
 		minutes *int
 		want    time.Duration
 	}{
-		"absent": {nil, 10 * time.Minute},
-		"set":    {&ten, 10 * time.Minute},
+		"absent": {nil, 15 * time.Minute},
+		"set":    {&fifteen, 15 * time.Minute},
 		"off":    {&zero, 0},
 	}
 	for name, tc := range cases {
